@@ -1,0 +1,13 @@
+gradio
+pydantic
+python-dotenv
+requests
+beautifulsoup4
+pytesseract
+Pillow
+pypdf
+transformers
+accelerate
+bitsandbytes
+torch
+sentencepiece
