@@ -9,5 +9,4 @@ pypdf
 transformers
 accelerate
 bitsandbytes
-torch
 sentencepiece

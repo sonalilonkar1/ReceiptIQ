@@ -20,8 +20,8 @@ def _format_assistant_response(payload: dict) -> str:
 def _on_submit(
     message: str,
     file_path: Optional[str],
-    history: list[tuple[str, str]],
-) -> tuple[str, None, list[tuple[str, str]]]:
+    history: list,
+) -> tuple[str, None, list]:
     history = history or []
     message = (message or "").strip()
 
@@ -35,7 +35,11 @@ def _on_submit(
         assistant_text = f"Error processing request: {exc}"
 
     user_text = message if message else "[uploaded file]"
-    history.append((user_text, assistant_text))
+    
+    # Append messages in Gradio's expected format
+    history.append({"role": "user", "content": user_text})
+    history.append({"role": "assistant", "content": assistant_text})
+    
     return "", None, history
 
 

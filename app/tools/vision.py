@@ -66,6 +66,83 @@ def _extract_date(raw_text: str) -> Optional[str]:
     return match.group(0) if match else None
 
 
+def _classify_category(vendor: Optional[str], raw_text: str) -> str:
+    """Classify receipt into category: meals, travel, supplies, or other."""
+    if not vendor:
+        vendor = ""
+    
+    combined_text = (vendor + " " + raw_text).lower()
+    
+    # Meals keywords
+    meal_keywords = ["restaurant", "cafe", "coffee", "food", "pizza", "burger", "chicken", "subway", 
+                     "taco", "sushi", "diner", "bar", "pub", "bistro", "bakery", "grocery", "supermarket",
+                     "whole foods", "trader joe's", "sprouts", "safeway", "albertsons", "target food"]
+    
+    # Travel keywords
+    travel_keywords = ["uber", "lyft", "taxi", "hotel", "motel", "airbnb", "airline", "delta", "united",
+                      "southwest", "parking", "gas station", "shell", "chevron", "exxon", "bp", "hertz",
+                      "avis", "enterprise", "rental"]
+    
+    # Supplies keywords
+    supplies_keywords = ["office", "staples", "home depot", "lowes", "amazon", "best buy", "electronic",
+                        "computer", "software", "printer", "papermate", "pen", "notebook", "supply"]
+    
+    for keyword in meal_keywords:
+        if keyword in combined_text:
+            return "meals"
+    
+    for keyword in travel_keywords:
+        if keyword in combined_text:
+            return "travel"
+    
+    for keyword in supplies_keywords:
+        if keyword in combined_text:
+            return "supplies"
+    
+    return "other"
+
+
+def _extract_line_items(raw_text: str) -> Optional[str]:
+    """Extract line items from receipt text."""
+    lines = raw_text.splitlines()
+    items = []
+    
+    # Look for lines that have amount values (price indicators)
+    for line in lines:
+        line = line.strip()
+        if not line or len(line) < 3:
+            continue
+        
+        # Skip header/footer lines
+        if any(keyword in line.lower() for keyword in ["total", "subtotal", "tax", "receipt", "invoice", "date", "vendor"]):
+            continue
+        
+        # If line has amount pattern, likely an item
+        if re.search(_AMOUNT_REGEX, line):
+            items.append(line)
+    
+    if items:
+        return "|".join(items[:10])  # Store up to 10 items
+    
+    return None
+
+
+def _extract_invoice_number(raw_text: str) -> Optional[str]:
+    """Extract invoice/receipt number from text."""
+    patterns = [
+        r"(?:invoice|receipt)[\s#:]*(\d+)",
+        r"(?:inv|rec|ref)[\s#:]*(\d+)",
+        r"#\s*(\d{6,})",
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, raw_text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    
+    return None
+
+
 def extract_fields_from_image(image_path: str) -> dict:
     """Run OCR and extract key receipt fields into a dictionary."""
     image = Image.open(Path(image_path)).convert("RGB")
@@ -78,6 +155,9 @@ def extract_fields_from_image(image_path: str) -> dict:
     subtotal = _find_amount_by_labels(raw_text, ["subtotal", "sub total"])
     tax = _find_amount_by_labels(raw_text, ["tax", "vat", "gst", "sales tax"])
     total = _find_amount_by_labels(raw_text, ["total", "amount due", "balance due", "grand total"])
+    category = _classify_category(vendor, raw_text)
+    line_items = _extract_line_items(raw_text)
+    invoice_number = _extract_invoice_number(raw_text)
 
     extracted = {
         "doc_type": "receipt",
@@ -87,6 +167,10 @@ def extract_fields_from_image(image_path: str) -> dict:
         "subtotal": subtotal,
         "tax": tax,
         "total": total,
+        "category": category,
+        "line_items": line_items,
+        "invoice_number": invoice_number,
+        "description": f"Receipt from {vendor}" if vendor else "Receipt",
         "raw_text": raw_text,
     }
 
