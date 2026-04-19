@@ -1,12 +1,28 @@
-gradio
-pydantic
+# ReceiptIQ Dependencies
+# Python 3.12+ required (PyTorch compatibility)
+
+# Web UI
+gradio==6.12.0
+
+# Data
+pydantic>=2.13.0
 python-dotenv
-requests
-beautifulsoup4
-pytesseract
-Pillow
-pypdf
-transformers
-accelerate
-bitsandbytes
-sentencepiece
+requests>=2.33.0
+beautifulsoup4>=4.14.0
+
+# Image Processing & OCR
+pytesseract>=0.3.13
+Pillow>=12.0.0
+pypdf>=6.10.0
+
+# LLM & NLP
+torch==2.2.2  # Must be 2.2.2 for NumPy < 2.0 compatibility
+torchvision>=0.17.0
+torchaudio>=2.2.0
+numpy<2.0  # NumPy < 2.0 required for PyTorch 2.2.2
+transformers<4.45.0  # Pinned for PyTorch 2.2.2 compatibility (last tested version)
+sentencepiece>=0.2.1
+
+# Optional GPU accelerators (not required for CPU usage)
+accelerate>=1.13.0
+bitsandbytes>=0.42.0
