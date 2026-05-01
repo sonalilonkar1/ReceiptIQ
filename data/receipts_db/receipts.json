@@ -1,0 +1,250 @@
+{
+  "cord_train_00004.png": {
+    "doc_type": "receipt",
+    "vendor": "m 8450 BIH 143.6 3.8 rs",
+    "date": null,
+    "currency": "USD",
+    "subtotal": null,
+    "tax": 10.0,
+    "total": 58.0,
+    "category": "other",
+    "line_items": null,
+    "invoice_number": null,
+    "description": "Receipt from m 8450 BIH 143.6 3.8 rs",
+    "raw_text": "| =,\n|\nfz\nm@ 8450 BIH 143.6% 3.8% rs\nTOTA. as. & \u2018 4,\nTAX 10.00 7 4s >\nGRAND TOTAL 58.00 ay\nTUMAI | 00\n\u201cae ee\na\n",
+    "confidence_overall": 0.6,
+    "pending_review": true,
+    "missing_fields": [
+      "date",
+      "subtotal"
+    ]
+  },
+  "cord_train_00016.png": {
+    "doc_type": "receipt",
+    "vendor": "901016 -TICKET GP 20, 000",
+    "date": null,
+    "currency": "USD",
+    "subtotal": null,
+    "tax": null,
+    "total": 1.0,
+    "category": "other",
+    "line_items": null,
+    "invoice_number": null,
+    "description": "Receipt from 901016 -TICKET GP 20, 000",
+    "raw_text": "901016 -TICKET GP 20, 000\n16\nSubtotal 30,000\nTOTAL cQty 1.00)30,000\nwen fF |\nEOC BCA e\u00ae 6 # 39,000\n",
+    "confidence_overall": 0.4,
+    "pending_review": true,
+    "missing_fields": [
+      "date",
+      "subtotal",
+      "tax"
+    ]
+  },
+  "cord_train_00021.png": {
+    "doc_type": "receipt",
+    "vendor": "' lh ote",
+    "date": null,
+    "currency": "USD",
+    "subtotal": null,
+    "tax": null,
+    "total": 44.0,
+    "category": "other",
+    "line_items": ". 22,000 xt 22.000|73 22.000 yt . 22 R00|Tendered: 7 S0.000 2",
+    "invoice_number": null,
+    "description": "Receipt from ' lh ote",
+    "raw_text": "' \u2018lh ote\npone\n1001-Choca Bun es\n. 22,000 xt 22.000\n\u201cdtQd-Hokkaido Milk Toast\n73 22.000 yt . 22 R00\n\u00a3OOR-Plastic Bag Hediun\nL @ 6 xt o 4\nES otal ttem: a .\nTotal. + 44.000 \u00a9\nfaoCash .\nTendered: 7 S0.000 2\nos .\n",
+    "confidence_overall": 0.4,
+    "pending_review": true,
+    "missing_fields": [
+      "date",
+      "subtotal",
+      "tax"
+    ]
+  },
+  "cord_train_00026.png": {
+    "doc_type": "receipt",
+    "vendor": "nal Neagle Sy a iar Na 2 a we",
+    "date": null,
+    "currency": "USD",
+    "subtotal": null,
+    "tax": null,
+    "total": 16.5,
+    "category": "supplies",
+    "line_items": null,
+    "invoice_number": null,
+    "description": "Receipt from nal Neagle Sy a iar Na 2 a we",
+    "raw_text": "= nal Neagle Sy a iar Na 2 a we\neas wry a - , as a a ONT a ee\naoe rae ee Des Ri ne Maree vas Ae\nhare eae ap 2 ha RR NM NARS a SEE EN\nNTN ET TB \u2122 mr. fie: ES Bis a ee\nOO Sl jee ES ee OS a\naa wae i atin: Ca Si wage te Nn See RG wine:\n. s., . ag . aa, See nc eR et\nMs a | \u2014 \u2018 Sia Sa a eo\nren wey 7 we At ee\u201d ial\n- tay ia ao \u201c \u201d eer hs a .\n7 ue Laer eae ew, aor hon nd\nFe oo wot as, . Fon mae aren eee oor Ne\n. Stee PN eS \u201ci te, Merete Nee a\nOe Re a ne ee ne ee ne ae in te ik ate me ene ne ee vee cae cee ate nee wee ve SR Pe ;\n~ Late. ern oe aS om TN, i. BoE en,\nSe yt a ra UR Se SS See\nre. oc ae ia a Meee os \u2018\necco Pepenero Paste YEN Sa\nEe Oe am ee cane aoe ne Ane cee ee eae ee ea Ce se ew sn cat at wate dpe vem wen Sa ; a Sees\nee Se se ata a ene me ee oe ae i nee nee eee mete te np ane cen is Mo Bee SON ast\nZ Total Rp 16.500 [cn\nCt cn tne eran my cane ma ny Nt em war oe eH ee ek he ae oe ne ey Oe ne ne ane ee oa be * ae . er . . Soe ot\nas 1 bd : ee Pty, . 4 tegen, Be\nange , oo. PAR\n\u2122 Soe tee Om Fm Ak we ak ee Mt et A a eo dae Ss a WR Mee wae Sos ae ue Ae ke ne ee cee fo au - me Me .\n",
+    "confidence_overall": 0.4,
+    "pending_review": true,
+    "missing_fields": [
+      "date",
+      "subtotal",
+      "tax"
+    ]
+  },
+  "cord_train_00029.png": {
+    "doc_type": "receipt",
+    "vendor": "oe Ryo ores",
+    "date": null,
+    "currency": "USD",
+    "subtotal": null,
+    "tax": null,
+    "total": 226500.0,
+    "category": "other",
+    "line_items": null,
+    "invoice_number": null,
+    "description": "Receipt from oe Ryo ores",
+    "raw_text": "oe Ryo ores\nwe om rome fae Denia\na wh ATES ;\nwit OE. ear te 122, S06)\n: _ . ; eet a\ng oo. re we QP QTS\nj : , = be TNL fot\n\"SBR TOTAL 226,500.00 . 4\n: ee wath Eee \u201c iy FSi,\npes me ; - a\nre. cS er Be uke, \u201cae ee Fre eel ie\npe ae Be, RY Ce hs EE Sa ERR ae 2 Ee sgh: Sabre oa\nee eae SOE Bae geen eo ee ee ee ae\n",
+    "confidence_overall": 0.4,
+    "pending_review": true,
+    "missing_fields": [
+      "date",
+      "subtotal",
+      "tax"
+    ]
+  },
+  "cord_train_00048.png": {
+    "doc_type": "receipt",
+    "vendor": "Sain ae ae at ele eet 7 oe et Te on . 7 . a",
+    "date": null,
+    "currency": "USD",
+    "subtotal": null,
+    "tax": null,
+    "total": 73.45,
+    "category": "other",
+    "line_items": "7 2 = 7.500 15.000 =|PB1( 10%) Rp 6.500 :|SC(3%) Rp 1.950|Cash Rp 100.000|Change Rp 26.550",
+    "invoice_number": null,
+    "description": "Receipt from Sain ae ae at ele eet 7 oe et Te on . 7 . a",
+    "raw_text": "Sain ae ae at ele eet 7 oe \u201cet Te on . 7 . a ;\napes a4 . a _\nee a ee\nod Nasi Putin a\n\u201com 4 aw oo\nees Y Sambel Kecap a SE\n7 2 = 7.500 15.000 =\nSubtotal Rp 65 006 es\nPB1( 10%) Rp 6.500 :\nSC(3%) Rp 1.950\nTotal Ro 73.450\nCash Rp 100.000\nChange Rp 26.550\n",
+    "confidence_overall": 0.4,
+    "pending_review": true,
+    "missing_fields": [
+      "date",
+      "subtotal",
+      "tax"
+    ]
+  },
+  "cord_train_00062.png": {
+    "doc_type": "receipt",
+    "vendor": "Qo sevn-n----- i",
+    "date": null,
+    "currency": "USD",
+    "subtotal": null,
+    "tax": null,
+    "total": 0.0,
+    "category": "supplies",
+    "line_items": ": RALPH BREAKS THE INTERNET : WR 3.600.000 2|-TIKET 60.000 60 E|= BCACEDC) VISA (..**-6468) 3.600.000 4",
+    "invoice_number": null,
+    "description": "Receipt from Qo sevn-n----- i",
+    "raw_text": "Qo sevn-n--+--- i\n4 SSS een eae SILOS io ssioasssross---- E\n\u00a5 on ee\ni ee eee ;\n: RALPH BREAKS THE INTERNET : WR 3.600.000 2\n -TIKET 60.000 60 E\niouneumjaeespenebnahomateendbnentanshasseesendheeatenstianevafamnbandiaantiaartanstemndanpanabesnaasantbeunteedhpeshununisruhanbasipwotaniantninsshn &\n- Total (Qty=60) 3.600.000 \u00a5\ni\": ce \u2018fe\n4 4 Soe a mre eam ore ae we rn a nt x\nx aut B.\n= BCACEDC) VISA (..**-6468) 3.600.000 4\n% a ie\nree. TOM\n\u201c. ie eed yweNAS 3 Be ; S | x\n",
+    "confidence_overall": 0.4,
+    "pending_review": true,
+    "missing_fields": [
+      "date",
+      "subtotal",
+      "tax"
+    ]
+  },
+  "cord_train_00067.png": {
+    "doc_type": "receipt",
+    "vendor": "CL aS Dar gaia a",
+    "date": null,
+    "currency": "USD",
+    "subtotal": null,
+    "tax": null,
+    "total": 69.0,
+    "category": "other",
+    "line_items": "1 Popcorn Salt Bucket 65.000|CASH 65.000",
+    "invoice_number": null,
+    "description": "Receipt from CL aS Dar gaia a",
+    "raw_text": "CL aS Dar gaia a\na ey he Beri i\noe soe\nSS\n| \u201d ,\n| @ As\ne+ @\n1 Popcorn Salt Bucket 65.000\nTOTAL 69.000\nCASH 65.000\nCHANGED 0\n= =\n",
+    "confidence_overall": 0.4,
+    "pending_review": true,
+    "missing_fields": [
+      "date",
+      "subtotal",
+      "tax"
+    ]
+  },
+  "cord_train_00068.png": {
+    "doc_type": "receipt",
+    "vendor": "a Va Or pattng ao teat ar eeta A aa tea he Re Ot. a  Te ESE a ME ae.",
+    "date": null,
+    "currency": "USD",
+    "subtotal": null,
+    "tax": null,
+    "total": 113000.0,
+    "category": "other",
+    "line_items": "So 37,500.00 ip see re|Eo pipes he 37,500.00 Be ce oh|Sie REIT. = 5.00",
+    "invoice_number": null,
+    "description": "Receipt from a Va Or pattng ao teat ar eeta A aa tea he Re Ot. a  Te ESE a ME ae.",
+    "raw_text": "a Va Or pattng ao teat ar eeta A aa tea he Re Ot. a : Te ESE a: ME ae.\nRees \u2018Gucecaeene ea pester pcre\nfoi itt 4. es, tent rae ht ieee \"4 ASS my me a ke ER ee Zoe eee SRD ca - ae ;. ms ieee\n\nee sep talent se alata ali on ae are\n\ntN eerie eae z SPEER OEL eae ame\n\noy Fe et Sate ig, oe ike Napanee SER ad\n\nye Vee zeal \u2014\u2014N eee ee : :\n\nee TNE ea ie SO AB glean,\n\n. arias vies ome wey Pye a One ii: Orr tS Setar ahetrers\n\n\u2018 oe an Seae on BY \u201d } :\n\nSy nee ee ee ee Baer re orn\n\nCAT ho at oes were 7 wr on ; Loo a ae OCT ai vat ntieks :\nva Ug ete Pat Noe ere'y: ae Aes\n\nem - 4 eee im on See re\nmoe . at ah TU be ae Tes ees 3\nft. Pane) he See ps\nwo es TTS pak EC a cameos\n\nSle Do fee 1 Berry Many-Low (P} Be Ee\n\nSo 37,500.00 ip see re\nfo TT Ea eg Sa BRE\n\nEo pipes he 37,500.00 Be ce oh\n\na amie at 7 Set st fey ts\n\nBiers we me nme we nad . rots\n\ncay nap codernecinme | PLASTIC BAG\n\npeed ye Gen aig: Set oe |\n\nI De ne cs, je aa\n\nSie REIT. = 5.00\n\nSe eae RE Discount 00\n\noie ar Total 113,000.00\n\noe: | 4 item(s). dosed. 2\u00bb \u201c\n\n- . A tet z \u201c\n",
+    "confidence_overall": 0.4,
+    "pending_review": true,
+    "missing_fields": [
+      "date",
+      "subtotal",
+      "tax"
+    ]
+  },
+  "cord_train_00083.png": {
+    "doc_type": "receipt",
+    "vendor": "1 ICED White 43.000",
+    "date": null,
+    "currency": "USD",
+    "subtotal": 101.0,
+    "tax": null,
+    "total": 101.0,
+    "category": "other",
+    "line_items": "_ 1 ICED White 43.000|) 1 Mexican Baked Rice 58.000|DEBIT 101.000",
+    "invoice_number": null,
+    "description": "Receipt from 1 ICED White 43.000",
+    "raw_text": "_ 1 ICED White 43.000\n) 1 Mexican Baked Rice 58.000\n| Subtotal 101.000\nTotal 101.000\nDEBIT 101.000\nChange | 0\n: gmlots out ape |\n",
+    "confidence_overall": 0.6,
+    "pending_review": true,
+    "missing_fields": [
+      "date",
+      "tax"
+    ]
+  },
+  "cord_train_00086.png": {
+    "doc_type": "receipt",
+    "vendor": "oC 600",
+    "date": null,
+    "currency": "USD",
+    "subtotal": 20.0,
+    "tax": 2.06,
+    "total": 2.06,
+    "category": "other",
+    "line_items": null,
+    "invoice_number": null,
+    "description": "Receipt from oC 600",
+    "raw_text": "ty: 1 Subtotal] 20.000\noC 600\nTax Total 2.060\n\nGrand Total 2.060 fj\n",
+    "confidence_overall": 0.8,
+    "pending_review": true,
+    "missing_fields": [
+      "date"
+    ]
+  },
+  "cord_train_00096.png": {
+    "doc_type": "receipt",
+    "vendor": "s Dom sl gp",
+    "date": null,
+    "currency": "USD",
+    "subtotal": null,
+    "tax": null,
+    "total": 22.0,
+    "category": "other",
+    "line_items": "\\ @22 .000 22.000 | ||CASH \u2014_ 52.000|CHANGED 30.000",
+    "invoice_number": null,
+    "description": "Receipt from s Dom sl gp",
+    "raw_text": "\u2014s Dom sl gp\u2019\nee Rol Uocn Que\n\\ @22 .000 22.000 | |\n\u00ae 3B-TOTAL 22.000\n| GRANDTOTAL 22,000\nCASH \u2014_ 52.000\nCHANGED 30.000\n",
+    "confidence_overall": 0.4,
+    "pending_review": true,
+    "missing_fields": [
+      "date",
+      "subtotal",
+      "tax"
+    ]
+  }
+}
