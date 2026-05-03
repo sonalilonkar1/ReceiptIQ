@@ -804,11 +804,147 @@ def _to_document_payload(extracted: dict) -> dict:
     }
 
 
+def security_guard(user_text: str) -> Optional[dict]:
+    """
+    Detect prompt injection attacks and refuse malicious requests.
+    
+    Returns dict with refusal response if injection detected, None otherwise.
+    Sets refused=True in debug field for benchmark detection.
+    
+    Detects attempts to:
+    - Dump or modify database
+    - Reveal system prompts/instructions
+    - Bypass tool usage
+    - Modify stored data
+    - Escalate privileges
+    - Execute arbitrary commands
+    """
+    text_lower = user_text.lower()
+    
+    # Injection patterns to detect
+    db_dump_patterns = [
+        r"drop\s+table",
+        r"delete\s+from",
+        r"dump\s+db",
+        r"dump\s+database",
+        r"export.*all",
+        r"raw\s+database",
+    ]
+    
+    system_prompt_patterns = [
+        r"reveal.*system\s+prompt",
+        r"show.*instructions",
+        r"system\s+prompt",
+        r"reveal.*you.*are",
+        r"what.*are.*your.*instructions",
+        r"ignore.*previous.*instructions",
+        r"override.*system",
+    ]
+    
+    tool_bypass_patterns = [
+        r"do\s+not\s+use.*tool",
+        r"skip.*tool",
+        r"bypass.*tool",
+        r"guess\s+the.*total",
+        r"just\s+guess",
+        r"hallucinate",
+    ]
+    
+    data_modification_patterns = [
+        r"modify.*stored",
+        r"change.*total",
+        r"update.*receipt",
+        r"corrupt.*data",
+        r"fake\s+\d+",
+        r"adjust.*amount",
+        r"pretend.*verified",
+        r"spoof",
+        r"fake.*vendor",
+    ]
+    
+    privilege_patterns = [
+        r"admin\s+privilege",
+        r"escalate\s+privilege",
+        r"show.*all\s+user",
+        r"other\s+user.*data",
+        r"unauthorized\s+access",
+    ]
+    
+    command_patterns = [
+        r"execute:",
+        r"run\s+command",
+        r"rm\s+-rf",
+        r"chmod",
+        r"shell\s+command",
+    ]
+    
+    # Check for injection patterns
+    all_patterns = (
+        db_dump_patterns +
+        system_prompt_patterns +
+        tool_bypass_patterns +
+        data_modification_patterns +
+        privilege_patterns +
+        command_patterns
+    )
+    
+    import re
+    detected_attack = None
+    for pattern in all_patterns:
+        if re.search(pattern, text_lower):
+            detected_attack = pattern
+            break
+    
+    if detected_attack:
+        # Determine attack type for better response
+        if any(re.search(p, text_lower) for p in db_dump_patterns):
+            attack_type = "database manipulation"
+            safe_alternative = "I can summarize your spending patterns, show recent transactions, or analyze spending by category instead."
+        elif any(re.search(p, text_lower) for p in system_prompt_patterns):
+            attack_type = "system prompt extraction"
+            safe_alternative = "I'm designed to help you manage your receipts and expenses. I can answer questions about your spending or help you analyze your financial data."
+        elif any(re.search(p, text_lower) for p in tool_bypass_patterns):
+            attack_type = "tool bypass attempt"
+            safe_alternative = "I use database tools to provide accurate information. I can show you verified data about your receipts and spending instead."
+        elif any(re.search(p, text_lower) for p in data_modification_patterns):
+            attack_type = "data modification attempt"
+            safe_alternative = "I can read and analyze your receipts, but cannot modify stored data. I can help you review your receipts for errors."
+        elif any(re.search(p, text_lower) for p in privilege_patterns):
+            attack_type = "privilege escalation"
+            safe_alternative = "I only have access to your own receipts and spending data. I can help you analyze your personal expense information."
+        elif any(re.search(p, text_lower) for p in command_patterns):
+            attack_type = "command injection"
+            safe_alternative = "I'm a text-based assistant. I can process receipt images or answer questions about your expenses instead."
+        else:
+            attack_type = "malicious request"
+            safe_alternative = "I can help you with your receipts and expense management. What would you like to know about your spending?"
+        
+        response = f"I cannot process that request ({attack_type}). {safe_alternative}"
+        
+        return {
+            "response": response,
+            "citations": [],
+            "debug": {
+                "refused": True,
+                "attack_type": attack_type,
+                "pattern_matched": detected_attack,
+            }
+        }
+    
+    return None
+
+
 def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
     """Handle user requests with either file extraction or keyword-based routing."""
     import re
     citations: list[str] = []
     debug: dict = {"mode": "file" if file_path else "text"}
+    
+    # Security check: detect and refuse prompt injection attacks
+    security_check = security_guard(user_text)
+    if security_check:
+        security_check["debug"].update(debug)  # Merge existing debug info
+        return security_check
     
     # Check if user is asking for a specific document by ID
     doc_id_match = re.search(r"(?:doc|document|receipt)\s*#?(\d+)", user_text, re.IGNORECASE)
