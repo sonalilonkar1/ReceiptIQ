@@ -99,25 +99,76 @@ Run all commands from the ReceiptIQ project root.
 
 ---
 
-## Example Queries
+## Usage Guide
 
-### Basic Queries
+### Chat Tab
+Ask the assistant to process receipts or analyze spending:
 ```
+"Upload a receipt"
+"Weekly summary"
+"Monthly summary"
+"Show pending receipts"
 "Show spending by vendor"
-"Find anomalies in my receipts"
-"What's my total spending?"
-"List recent receipts"
+"Find duplicate receipts"
 ```
 
-### Advanced Queries
+### Dashboard Tab
+View spending analytics by week or month:
+1. Select **Period**: "week" or "month" from dropdown
+2. Click **Refresh** button to load latest data
+3. View **Spending by Category** table (period, category, total, count)
+4. View **Top Vendors** table (period, vendor, total spend)
+
+**Table auto-updates when period changes.**
+
+### Pending Receipts Tab
+Complete incomplete receipts with missing data:
+
+1. **View Pending List** — Table shows doc_id, vendor, date, total, missing fields
+2. **Click a Row** — Select a receipt to load its data into the edit form
+3. **Edit Form** — Fill in missing information:
+   - Vendor name
+   - Receipt date (YYYY-MM-DD format)
+   - Category (dropdown: meals, travel, supplies, other)
+   - Subtotal, tax, total amounts
+   - Invoice number (optional)
+4. **Save** — Click "Update Receipt" to save changes
+5. **Learn** — System learns vendor→category associations for future receipts
+
+**System learns from corrections:** If you edit a receipt and set vendor + category, the system remembers that vendor's category for future receipts.
+
+### Adding Categories
+Categories are customizable and learned:
+- **Default Categories:** meals, travel, supplies, other
+- **Add Custom Category:** Edit a receipt and set a new category (e.g., "equipment")
+- **Automatic Learning:** When you set vendor + category, system learns the association
+- **Future Auto-Categorization:** New receipts from that vendor get the learned category
+
+---
+
+## Example Prompts
+
+### Calendar Analytics
 ```
-"How much did I spend on meals vs travel last 30 days?"
-"Find potential duplicate receipts"
-"Show receipts that violate expense rules"
-"Compare spending patterns across two date ranges"
-"Export receipts as CSV"
-"Verify vendor information"
+"Weekly summary"          → Last 8 weeks of spending by category
+"Monthly summary"         → Last 6 months of spending by category
 ```
+
+### Pending Receipts
+```
+"Show pending receipts"   → List all incomplete receipts
+```
+
+### Classic Queries
+```
+"List recent receipts"
+"Show spending by vendor"
+"Total spending by category"
+"Find duplicate receipts"
+"Compare spending patterns"
+```
+
+---
 
 ### Security & Reliability
 The system includes a **security guard** that automatically detects and refuses:
