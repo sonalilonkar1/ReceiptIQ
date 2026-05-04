@@ -23,10 +23,14 @@ from app.tools.db import (
     get_document_by_id,
     get_recent_docs,
     get_reimbursement_summary,
+    get_vendor_category,
     insert_document,
+    list_pending_receipts,
     spend_by_category,
+    spend_by_category_calendar,
     spend_by_vendor,
     verify_vendor,
+    _connect,
 )
 from app.tools.vision import extract_fields_from_image, validate_totals
 from app.tools.web import web_lookup
@@ -463,6 +467,9 @@ def _get_intent_with_llm(user_text: str) -> str:
 - recent: List recent receipts
 - spend_by_vendor: Analyze spending by vendor
 - spending_by_category: Show spending by category (meals/travel/supplies)
+- weekly_summary: Show weekly spending summary
+- monthly_summary: Show monthly spending summary
+- pending_receipts: List receipts with incomplete or missing data
 - duplicates: Find duplicate receipts
 - missing_fields: Find receipts with missing information
 - threshold_search: Find receipts above/below amount
@@ -498,10 +505,10 @@ Respond with ONLY the intent category (one word from the list above):"""
         
         # Valid intents
         valid_intents = {
-            "recent", "spend_by_vendor", "spending_by_category", "duplicates",
-            "missing_fields", "threshold_search", "rule_violations", "compare_periods",
-            "export_csv", "average_spend", "keyword_search", "reimbursement",
-            "web_lookup", "anomalies"
+            "recent", "spend_by_vendor", "spending_by_category", "weekly_summary",
+            "monthly_summary", "pending_receipts", "duplicates", "missing_fields",
+            "threshold_search", "rule_violations", "compare_periods", "export_csv",
+            "average_spend", "keyword_search", "reimbursement", "web_lookup", "anomalies"
         }
         
         # Find the intent in response
@@ -786,21 +793,50 @@ def _route_intent(user_text: str) -> str:
 
 
 def _to_document_payload(extracted: dict) -> dict:
-    """Map extracted vision keys to the DB schema payload."""
+    """Map extracted vision keys to the DB schema payload.
+    
+    Computes is_pending flag if any critical fields (vendor/date/total) are missing.
+    Overrides category if vendor exists in vendor_profiles.
+    """
+    vendor = extracted.get("vendor")
+    doc_date = extracted.get("date")
+    total = extracted.get("total")
+    
+    # Compute missing critical fields
+    missing_keys = []
+    if not vendor:
+        missing_keys.append("vendor")
+    if not doc_date:
+        missing_keys.append("date")
+    if total is None or total == 0:
+        missing_keys.append("total")
+    
+    is_pending = 1 if missing_keys else 0
+    
+    # Default category
+    category = extracted.get("category", "other")
+    
+    # Override category if vendor exists in vendor_profiles (learned associations)
+    if vendor:
+        learned_category = get_vendor_category(vendor)
+        if learned_category:
+            category = learned_category
+    
     return {
         "doc_type": extracted.get("doc_type", "receipt"),
-        "vendor": extracted.get("vendor"),
-        "doc_date": extracted.get("date"),
+        "vendor": vendor,
+        "doc_date": doc_date,
         "currency": extracted.get("currency", "USD"),
         "subtotal": extracted.get("subtotal"),
         "tax": extracted.get("tax"),
-        "total": extracted.get("total"),
+        "total": total,
         "confidence": extracted.get("confidence_overall"),
-        "category": extracted.get("category", "other"),
+        "category": category,
         "line_items": extracted.get("line_items"),
         "description": extracted.get("description"),
         "invoice_number": extracted.get("invoice_number"),
         "raw_text": extracted.get("raw_text"),
+        "is_pending": is_pending,
     }
 
 
@@ -978,6 +1014,18 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
             citations.append(f"DB:audit_flags.doc_id={doc_id}")
             flagged = True
 
+        # Check if receipt is pending
+        is_pending = db_payload.get("is_pending", 0)
+        
+        # Compute missing fields for display
+        missing_fields = []
+        if not db_payload.get("vendor"):
+            missing_fields.append("vendor")
+        if not db_payload.get("doc_date"):
+            missing_fields.append("date")
+        if not db_payload.get("total"):
+            missing_fields.append("total")
+
         vendor = extracted.get("vendor") or "unknown vendor"
         date = extracted.get("date") or "unknown date"
         total = extracted.get("total")
@@ -985,14 +1033,22 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
 
         response = (
             f"Processed receipt for {vendor} on {date}. "
-            f"Total: {total_text}. Saved as doc_id={doc_id}."
+            f"Total: {total_text}. Saved as doc_id={doc_id}. "
+            f"Pending: {'Yes' if is_pending else 'No'}."
         )
+        
+        if is_pending:
+            response += f" Missing: {', '.join(missing_fields)}."
+            response += " Open the 'Pending Receipts' tab to complete the data."
+        
         if flagged:
             response += f" Audit flag added ({mismatch})."
 
         debug["intent"] = "file_ingest"
         debug["doc_id"] = doc_id
         debug["flagged"] = flagged
+        debug["is_pending"] = is_pending
+        debug["missing_fields"] = missing_fields
         return {"response": response, "citations": citations, "debug": debug}
 
     intent = _route_intent(user_text)
@@ -1346,6 +1402,116 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
             debug["models_used"] = ["Phi (router)"]
         
         debug["anomalies"] = anomalies if 'anomalies' in locals() else None
+        debug["latency_ms"] = round((time.time() - start_time) * 1000, 2)
+        citations.append("DB:documents")
+        return {"response": response, "citations": citations, "debug": debug}
+
+    if intent == "weekly_summary":
+        start_time = time.time()
+        debug["routing_model"] = "phi"
+        debug["writer_model"] = "formatter"
+        
+        try:
+            rows = spend_by_category_calendar(period="week", n_periods=8)
+            
+            if not rows:
+                response = "No receipt data available for weekly summary."
+            else:
+                # Format as grouped by week
+                weeks_dict = {}
+                for period_label, category, total_spend, count in rows:
+                    if period_label not in weeks_dict:
+                        weeks_dict[period_label] = {}
+                    weeks_dict[period_label][category] = {"total": total_spend, "count": count}
+                
+                response = "**Weekly Spending Summary (Last 8 Weeks)**\n\n"
+                for week in sorted(weeks_dict.keys(), reverse=True):
+                    response += f"**Week {week}**\n"
+                    week_total = 0
+                    for category, data in sorted(weeks_dict[week].items()):
+                        amount = data["total"]
+                        count = data["count"]
+                        week_total += amount
+                        response += f"  • {category.capitalize()}: ${amount:.2f} ({count} items)\n"
+                    response += f"  **Week Total: ${week_total:.2f}**\n\n"
+        except Exception:
+            response = "Error generating weekly summary."
+        
+        debug["models_used"] = ["Phi (router)"]
+        debug["latency_ms"] = round((time.time() - start_time) * 1000, 2)
+        citations.append("DB:documents")
+        return {"response": response, "citations": citations, "debug": debug}
+
+    if intent == "monthly_summary":
+        start_time = time.time()
+        debug["routing_model"] = "phi"
+        debug["writer_model"] = "formatter"
+        
+        try:
+            rows = spend_by_category_calendar(period="month", n_periods=6)
+            
+            if not rows:
+                response = "No receipt data available for monthly summary."
+            else:
+                # Format as grouped by month
+                months_dict = {}
+                for period_label, category, total_spend, count in rows:
+                    if period_label not in months_dict:
+                        months_dict[period_label] = {}
+                    months_dict[period_label][category] = {"total": total_spend, "count": count}
+                
+                response = "**Monthly Spending Summary (Last 6 Months)**\n\n"
+                for month in sorted(months_dict.keys(), reverse=True):
+                    response += f"**Month {month}**\n"
+                    month_total = 0
+                    for category, data in sorted(months_dict[month].items()):
+                        amount = data["total"]
+                        count = data["count"]
+                        month_total += amount
+                        response += f"  • {category.capitalize()}: ${amount:.2f} ({count} items)\n"
+                    response += f"  **Month Total: ${month_total:.2f}**\n\n"
+        except Exception:
+            response = "Error generating monthly summary."
+        
+        debug["models_used"] = ["Phi (router)"]
+        debug["latency_ms"] = round((time.time() - start_time) * 1000, 2)
+        citations.append("DB:documents")
+        return {"response": response, "citations": citations, "debug": debug}
+
+    if intent == "pending_receipts":
+        start_time = time.time()
+        debug["routing_model"] = "phi"
+        debug["writer_model"] = "formatter"
+        
+        try:
+            pending = list_pending_receipts(limit=50)
+            
+            if not pending:
+                response = "No pending receipts. All receipts are complete!"
+            else:
+                # Format as markdown table
+                response = f"**Pending Receipts ({len(pending)} total)**\n\n"
+                response += "| Doc ID | Vendor | Date | Total | Missing Fields |\n"
+                response += "|--------|--------|------|-------|----------------|\n"
+                
+                for item in pending:
+                    doc_id = item.get("doc_id", "")
+                    vendor = item.get("vendor") or "(empty)"
+                    date = item.get("doc_date") or "(empty)"
+                    total = item.get("total") or "0.00"
+                    missing = item.get("missing_fields", "none")
+                    
+                    # Format total as currency if numeric
+                    if isinstance(total, (int, float)):
+                        total = f"${total:.2f}"
+                    
+                    response += f"| {doc_id} | {vendor} | {date} | {total} | {missing} |\n"
+                
+                response += f"\n**Action:** Open the 'Pending Receipts' tab to complete these receipts."
+        except Exception:
+            response = "Error retrieving pending receipts."
+        
+        debug["models_used"] = ["Phi (router)"]
         debug["latency_ms"] = round((time.time() - start_time) * 1000, 2)
         citations.append("DB:documents")
         return {"response": response, "citations": citations, "debug": debug}
