@@ -7,7 +7,11 @@ from typing import Optional
 import gradio as gr
 
 from app.agent import handle_message
-from app.storage import get_pending_review_receipts, get_receipt, update_receipt
+from app.tools.db import (
+    spend_by_category_calendar,
+    top_vendors_calendar,
+    list_pending_receipts,
+)
 
 
 def _format_assistant_response(payload: dict) -> str:
@@ -18,88 +22,83 @@ def _format_assistant_response(payload: dict) -> str:
     return response
 
 
-def _load_pending_receipts_table() -> tuple[list, list]:
-    """Load pending receipts for table display."""
-    pending = get_pending_review_receipts()
-    if not pending:
-        return [], []
-    
-    # Create table rows
-    headers = ["Image", "Missing Fields", "Confidence", "Vendor", "Date", "Total"]
-    rows = []
-    for receipt in pending:
-        missing = ", ".join(receipt.get("missing_fields", []))
-        rows.append([
-            receipt["image_name"],
-            missing,
-            f"{receipt.get('confidence_overall', 0):.0%}",
-            receipt.get("vendor", "—"),
-            receipt.get("date", "—"),
-            f"${receipt.get('total', '—')}" if receipt.get('total') is not None else "—",
-        ])
-    
-    return headers, rows
-
-
-def _on_receipt_select(selected_row: list) -> tuple[str, str, str, str, str, str, str, str]:
-    """Load receipt details when row is selected."""
-    if not selected_row or not selected_row[0]:
-        return "", "", "", "", "", "", "", ""
-    
-    image_name = selected_row[0]
-    receipt = get_receipt(image_name)
-    
-    if not receipt:
-        return "", "", "", "", "", "", "", ""
-    
-    return (
-        image_name,
-        receipt.get("vendor", ""),
-        receipt.get("date", ""),
-        receipt.get("category", ""),
-        str(receipt.get("subtotal", "")),
-        str(receipt.get("tax", "")),
-        str(receipt.get("total", "")),
-        receipt.get("invoice_number", ""),
-    )
-
-
-def _on_receipt_update(
-    image_name: str,
-    vendor: str,
-    date: str,
-    category: str,
-    subtotal: str,
-    tax: str,
-    total: str,
-    invoice_number: str,
-) -> str:
-    """Update receipt and return success message."""
-    if not image_name:
-        return "❌ No receipt selected"
-    
+def _get_spending_by_category_data(period: str) -> list[list]:
+    """Fetch spending by category data and format for dataframe."""
     try:
-        updates = {
-            "vendor": vendor.strip() if vendor else None,
-            "date": date.strip() if date else None,
-            "category": category.strip() if category else None,
-            "subtotal": float(subtotal) if subtotal.strip() else None,
-            "tax": float(tax) if tax.strip() else None,
-            "total": float(total) if total.strip() else None,
-            "invoice_number": invoice_number.strip() if invoice_number else None,
-        }
+        rows = spend_by_category_calendar(period=period, n_periods=8)
+        if not rows:
+            return []
         
-        update_receipt(image_name, updates)
-        return f"✅ Updated {image_name} successfully!"
-    except ValueError as e:
-        return f"❌ Error: Invalid number format. {e}"
+        # Format: (period_label, category, total_spend, count)
+        formatted = []
+        for period_label, category, total_spend, count in rows:
+            formatted.append([
+                period_label,
+                category.capitalize(),
+                f"${total_spend:.2f}",
+                int(count),
+            ])
+        return formatted
     except Exception as e:
-        return f"❌ Error updating receipt: {e}"
+        return []
 
 
-def _refresh_pending_table() -> tuple[list, list]:
-    """Refresh the pending receipts table."""
-    return _load_pending_receipts_table()
+def _get_top_vendors_data(period: str) -> list[list]:
+    """Fetch top vendors data and format for dataframe."""
+    try:
+        rows = top_vendors_calendar(period=period, n_periods=8, top_k=5)
+        if not rows:
+            return []
+        
+        # Format: (period_label, vendor, total_spend)
+        formatted = []
+        for period_label, vendor, total_spend in rows:
+            formatted.append([
+                period_label,
+                vendor or "(Unknown)",
+                f"${total_spend:.2f}",
+            ])
+        return formatted
+    except Exception as e:
+        return []
+
+
+def _get_pending_receipts_data() -> list[list]:
+    """Fetch pending receipts data and format for dataframe."""
+    try:
+        pending = list_pending_receipts(limit=50)
+        if not pending:
+            return []
+        
+        formatted = []
+        for item in pending:
+            doc_id = item.get("doc_id", "")
+            vendor = item.get("vendor") or "(empty)"
+            date = item.get("doc_date") or "(empty)"
+            total = item.get("total") or "0.00"
+            missing = item.get("missing_fields", "none")
+            
+            # Format total as currency
+            if isinstance(total, (int, float)):
+                total = f"${total:.2f}"
+            
+            formatted.append([
+                doc_id,
+                vendor,
+                date,
+                total,
+                missing,
+            ])
+        return formatted
+    except Exception as e:
+        return []
+
+
+def _refresh_dashboard_data(period: str) -> tuple[list[list], list[list]]:
+    """Refresh dashboard data based on selected period."""
+    category_data = _get_spending_by_category_data(period)
+    vendors_data = _get_top_vendors_data(period)
+    return category_data, vendors_data
 
 
 def _on_submit(
@@ -130,17 +129,19 @@ def _on_submit(
 
 def build_app() -> gr.Blocks:
     with gr.Blocks(title="ReceiptIQ") as demo:
-        gr.Markdown("# ReceiptIQ")
+        gr.Markdown("# ReceiptIQ - Expense Management")
         
         with gr.Tabs():
-            # Tab 1: Chat interface
+            # ===== Tab 1: Chat =====
             with gr.Tab("Chat"):
+                gr.Markdown("Chat with ReceiptIQ assistant or upload a receipt to process.")
+                
                 chatbot = gr.Chatbot(label="Assistant", height=420)
 
                 with gr.Row():
                     message = gr.Textbox(
                         label="Message",
-                        placeholder="Ask to list receipts, vendor spend, duplicates, or upload a file.",
+                        placeholder="Ask about recent receipts, spending, categories, weekly/monthly summaries, pending receipts, or upload a file.",
                         scale=4,
                     )
                     file_input = gr.File(
@@ -154,87 +155,77 @@ def build_app() -> gr.Blocks:
                 message.submit(_on_submit, [message, file_input, chatbot], [message, file_input, chatbot])
                 send_button.click(_on_submit, [message, file_input, chatbot], [message, file_input, chatbot])
 
-            # Tab 2: Pending review receipts
-            with gr.Tab("Show me pending review receipts"):
-                gr.Markdown("### Receipts Pending Manual Review")
-                gr.Markdown("Click on a row to edit the receipt fields. Fill in missing information and click 'Update Receipt'.")
+            # ===== Tab 2: Dashboard =====
+            with gr.Tab("Dashboard"):
+                gr.Markdown("### Spending Analytics")
                 
                 with gr.Row():
-                    refresh_btn = gr.Button("🔄 Refresh", variant="secondary")
-                
-                # Table display
-                headers, rows = _load_pending_receipts_table()
-                with gr.Row():
-                    receipt_table = gr.Dataframe(
-                        value=rows,
-                        headers=headers,
-                        interactive=False,
-                        row_count=10,
+                    period_dropdown = gr.Dropdown(
+                        choices=["week", "month"],
+                        value="week",
+                        label="Period",
+                        scale=1,
                     )
+                    refresh_btn = gr.Button("🔄 Refresh", variant="primary", scale=1)
                 
-                gr.Markdown("### Edit Selected Receipt")
-                
-                with gr.Row():
-                    image_name_display = gr.Textbox(label="Image Name", interactive=False)
-                
-                with gr.Row():
-                    vendor_field = gr.Textbox(label="Vendor", placeholder="e.g., Starbucks")
-                    date_field = gr.Textbox(label="Date", placeholder="e.g., 01/15/2024 or 2024-01-15")
-                
-                with gr.Row():
-                    category_field = gr.Dropdown(
-                        choices=["meals", "travel", "supplies", "other"],
-                        label="Category",
-                        interactive=True,
-                    )
-                    invoice_field = gr.Textbox(label="Invoice Number", placeholder="Optional")
-                
-                with gr.Row():
-                    subtotal_field = gr.Number(label="Subtotal ($)", precision=2)
-                    tax_field = gr.Number(label="Tax ($)", precision=2)
-                    total_field = gr.Number(label="Total ($)", precision=2)
-                
-                with gr.Row():
-                    update_btn = gr.Button("✅ Update Receipt", variant="primary")
-                    status_msg = gr.Textbox(label="Status", interactive=False)
-                
-                # Handle row selection
-                receipt_table.select(
-                    _on_receipt_select,
-                    [receipt_table],
-                    [
-                        image_name_display,
-                        vendor_field,
-                        date_field,
-                        category_field,
-                        subtotal_field,
-                        tax_field,
-                        total_field,
-                        invoice_field,
-                    ],
+                gr.Markdown("#### Spending by Category")
+                category_table = gr.Dataframe(
+                    value=_get_spending_by_category_data("week"),
+                    headers=["Period", "Category", "Total", "Count"],
+                    interactive=False,
                 )
                 
-                # Handle update
-                update_btn.click(
-                    _on_receipt_update,
-                    [
-                        image_name_display,
-                        vendor_field,
-                        date_field,
-                        category_field,
-                        subtotal_field,
-                        tax_field,
-                        total_field,
-                        invoice_field,
-                    ],
-                    [status_msg],
+                gr.Markdown("#### Top Vendors")
+                vendors_table = gr.Dataframe(
+                    value=_get_top_vendors_data("week"),
+                    headers=["Period", "Vendor", "Total Spend"],
+                    interactive=False,
                 )
                 
-                # Handle refresh
+                # Refresh button click handler
+                def on_dashboard_refresh(period):
+                    cat_data, vend_data = _refresh_dashboard_data(period)
+                    return cat_data, vend_data
+                
                 refresh_btn.click(
-                    _refresh_pending_table,
+                    on_dashboard_refresh,
+                    [period_dropdown],
+                    [category_table, vendors_table],
+                )
+                
+                # Period dropdown change handler
+                def on_period_change(period):
+                    cat_data, vend_data = _refresh_dashboard_data(period)
+                    return cat_data, vend_data
+                
+                period_dropdown.change(
+                    on_period_change,
+                    [period_dropdown],
+                    [category_table, vendors_table],
+                )
+
+            # ===== Tab 3: Pending Receipts =====
+            with gr.Tab("Pending Receipts"):
+                gr.Markdown("### Pending Receipts")
+                gr.Markdown("These receipts are missing critical information (vendor, date, or total). Click the refresh button to update the list.")
+                
+                with gr.Row():
+                    refresh_pending_btn = gr.Button("🔄 Refresh", variant="primary", scale=1)
+                
+                pending_table = gr.Dataframe(
+                    value=_get_pending_receipts_data(),
+                    headers=["Doc ID", "Vendor", "Date", "Total", "Missing Fields"],
+                    interactive=False,
+                )
+                
+                # Refresh button click handler
+                def on_pending_refresh():
+                    return _get_pending_receipts_data()
+                
+                refresh_pending_btn.click(
+                    on_pending_refresh,
                     [],
-                    [receipt_table],
+                    [pending_table],
                 )
 
     return demo
@@ -247,3 +238,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
