@@ -23,6 +23,7 @@ __pycache__/
 receiptiq.sqlite
 data/cord_100/
 data/cord_100_clean/
+data/sroie_100/
 
 # Environment variables
 .env
@@ -51,7 +52,7 @@ gradio_cached_examples/
 
 # Jupyter
 .ipynb_checkpoints/
-*.ipynb
+
 
 # Testing
 .pytest_cache/
