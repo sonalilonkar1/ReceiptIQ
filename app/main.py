@@ -11,6 +11,8 @@ from app.tools.db import (
     spend_by_category_calendar,
     top_vendors_calendar,
     list_pending_receipts,
+    update_document,
+    get_document_by_id,
 )
 
 
@@ -34,12 +36,13 @@ def _get_spending_by_category_data(period: str) -> list[list]:
         for period_label, category, total_spend, count in rows:
             formatted.append([
                 period_label,
-                category.capitalize(),
+                (category or "uncategorized").capitalize(),
                 f"${total_spend:.2f}",
-                int(count),
+                int(count) if count else 0,
             ])
         return formatted
     except Exception as e:
+        print(f"Error in _get_spending_by_category_data: {e}")
         return []
 
 
@@ -92,6 +95,75 @@ def _get_pending_receipts_data() -> list[list]:
         return formatted
     except Exception as e:
         return []
+
+
+def _get_pending_receipts_choices() -> list[str]:
+    """Get pending receipts as radio button choices."""
+    try:
+        pending = list_pending_receipts(limit=50)
+        if not pending:
+            return []
+        
+        choices = []
+        for item in pending:
+            doc_id = item.get("doc_id", "")
+            vendor = item.get("vendor") or "(empty)"
+            total = item.get("total") or "0.00"
+            
+            # Format as: "Doc #123 - Vendor - $12.34"
+            if isinstance(total, (int, float)):
+                total_str = f"${total:.2f}"
+            else:
+                total_str = str(total)
+            
+            choice_label = f"Doc #{doc_id} - {vendor} - {total_str}"
+            choices.append(choice_label)
+        
+        return choices
+    except Exception as e:
+        return []
+
+
+def _get_pending_receipts_data() -> list[list]:
+    """Fetch pending receipts data and format for dataframe."""
+    try:
+        pending = list_pending_receipts(limit=50)
+        if not pending:
+            return []
+        
+        formatted = []
+        for item in pending:
+            doc_id = item.get("doc_id", "")
+            vendor = item.get("vendor") or "(empty)"
+            date = item.get("doc_date") or "(empty)"
+            total = item.get("total") or "0.00"
+            missing = item.get("missing_fields", "none")
+            
+            # Format total as currency
+            if isinstance(total, (int, float)):
+                total = f"${total:.2f}"
+            
+            formatted.append([
+                doc_id,
+                vendor,
+                date,
+                total,
+                missing,
+            ])
+        return formatted
+    except Exception as e:
+        return []
+
+
+def _get_pending_receipt_by_index(index: int) -> dict:
+    """Get a specific pending receipt by index."""
+    try:
+        pending = list_pending_receipts(limit=50)
+        if index < 0 or index >= len(pending):
+            return {}
+        return pending[index]
+    except Exception as e:
+        return {}
 
 
 def _refresh_dashboard_data(period: str) -> tuple[list[list], list[list]]:
@@ -207,26 +279,184 @@ def build_app() -> gr.Blocks:
             # ===== Tab 3: Pending Receipts =====
             with gr.Tab("Pending Receipts"):
                 gr.Markdown("### Pending Receipts")
-                gr.Markdown("These receipts are missing critical information (vendor, date, or total). Click the refresh button to update the list.")
                 
+                # Check initial state
+                pending_choices = _get_pending_receipts_choices()
+                has_pending = len(pending_choices) > 0
+                
+                # Refresh button (always visible)
                 with gr.Row():
-                    refresh_pending_btn = gr.Button("🔄 Refresh", variant="primary", scale=1)
+                    refresh_pending_btn = gr.Button("🔄 Refresh List", variant="primary", scale=1)
                 
-                pending_table = gr.Dataframe(
-                    value=_get_pending_receipts_data(),
-                    headers=["Doc ID", "Vendor", "Date", "Total", "Missing Fields"],
-                    interactive=False,
+                # Message for when no pending receipts
+                no_pending_msg = gr.Markdown(
+                    "## ✅ No Pending Receipts\nAll receipts have been completed!",
+                    visible=not has_pending
+                )
+                
+                # Instructions
+                instructions_msg = gr.Markdown(
+                    "These receipts are missing critical information. Select one from the list below to edit it.",
+                    visible=has_pending
+                )
+                
+                # Radio buttons for selecting which receipt to edit (always created, visibility controlled separately)
+                pending_radio = gr.Radio(
+                    choices=pending_choices,
+                    label="Select a Receipt to Edit",
+                    info="Choose from pending receipts",
+                    visible=has_pending,
+                )
+                
+                # Edit form (initially hidden, shows only when a receipt is selected)
+                with gr.Group(visible=False) as edit_form_group:
+                    gr.Markdown("#### Edit Pending Receipt")
+                    
+                    with gr.Row():
+                        selected_doc_id = gr.Number(label="Doc ID", interactive=False, scale=3)
+                        close_form_btn = gr.Button("✕ Close", variant="secondary", scale=1)
+                    
+                    with gr.Row():
+                        edit_vendor = gr.Textbox(label="Vendor", scale=2)
+                        edit_category = gr.Dropdown(
+                            choices=["meals", "travel", "supplies", "other"],
+                            label="Category",
+                            value="other",
+                            scale=1,
+                        )
+                    
+                    with gr.Row():
+                        edit_date = gr.Textbox(label="Date (YYYY-MM-DD)", scale=1)
+                        edit_total = gr.Number(label="Total Amount", scale=1)
+                    
+                    with gr.Row():
+                        save_btn = gr.Button("💾 Save Changes", variant="primary", scale=2)
+                        clear_btn = gr.Button("🗑️ Clear", variant="secondary", scale=1)
+                    
+                    status_msg = gr.Textbox(label="Status", interactive=False, visible=True)
+                
+                # Handler: When radio selection changes, show form and load data
+                def on_radio_select(selected_label):
+                    """Load receipt data when radio button selected and show form."""
+                    if not selected_label:
+                        return 0, "other", "", "", 0, "No receipt selected", gr.update(visible=False)
+                    
+                    # Find matching receipt by label
+                    try:
+                        pending = list_pending_receipts(limit=50)
+                        for item in pending:
+                            doc_id = item.get("doc_id", "")
+                            vendor = item.get("vendor") or "(empty)"
+                            total = item.get("total") or "0.00"
+                            
+                            if isinstance(total, (int, float)):
+                                total_str = f"${total:.2f}"
+                            else:
+                                total_str = str(total)
+                            
+                            choice_label = f"Doc #{doc_id} - {vendor} - {total_str}"
+                            
+                            if choice_label == selected_label:
+                                # Found matching receipt - load and show form
+                                doc_id_int = int(doc_id) if doc_id else 0
+                                vendor = item.get("vendor") or ""
+                                date = item.get("doc_date") or ""
+                                total = float(item.get("total", 0)) if item.get("total") else 0
+                                category = item.get("category") or "other"
+                                
+                                return doc_id_int, category, vendor, date, total, f"✓ Loaded doc #{doc_id_int}", gr.update(visible=True)
+                        
+                        return 0, "other", "", "", 0, "Receipt not found", gr.update(visible=False)
+                    except Exception as e:
+                        return 0, "other", "", "", 0, f"Error: {str(e)}", gr.update(visible=False)
+                
+                # Handler: Save changes (always attach)
+                def save_pending_changes(doc_id, vendor, category, date, total):
+                    """Save edited pending receipt back to database."""
+                    if not doc_id or doc_id == 0:
+                        return "Please load a receipt first", gr.update(choices=_get_pending_receipts_choices(), value=None)
+                    
+                    try:
+                        doc_id_int = int(doc_id)
+                        updates = {}
+                        
+                        if vendor and vendor.strip():
+                            updates["vendor"] = vendor.strip()
+                        if category and category.strip():
+                            updates["category"] = category.strip()
+                        if date and date.strip():
+                            updates["doc_date"] = date.strip()
+                        if total and total > 0:
+                            updates["total"] = float(total)
+                        
+                        if not updates:
+                            return "No changes to save", gr.update(choices=_get_pending_receipts_choices(), value=None)
+                        
+                        # If vendor, date, and total are all provided, mark as no longer pending
+                        has_vendor = updates.get("vendor") or (vendor and vendor.strip())
+                        has_date = updates.get("doc_date") or (date and date.strip())
+                        has_total = updates.get("total") or (total and total > 0)
+                        
+                        if has_vendor and has_date and has_total:
+                            updates["is_pending"] = False
+                        
+                        update_document(doc_id_int, updates)
+                        # Return updated choices to refresh the radio button
+                        return f"✓ Saved doc #{doc_id_int}", gr.update(choices=_get_pending_receipts_choices(), value=None)
+                    except Exception as e:
+                        return f"Error saving: {str(e)}", gr.update(choices=_get_pending_receipts_choices(), value=None)
+                
+                save_btn.click(
+                    save_pending_changes,
+                    [selected_doc_id, edit_vendor, edit_category, edit_date, edit_total],
+                    [status_msg, pending_radio],
+                )
+                
+                # Handler: Clear form
+                def clear_form():
+                    return 0, "other", "", "", 0, "Cleared"
+                
+                clear_btn.click(
+                    clear_form,
+                    [],
+                    [selected_doc_id, edit_category, edit_vendor, edit_date, edit_total, status_msg],
+                )
+                
+                # Handler: Close form
+                def close_form():
+                    return None, gr.update(visible=False)
+                
+                close_form_btn.click(
+                    close_form,
+                    [],
+                    [pending_radio, edit_form_group],
                 )
                 
                 # Refresh button click handler
                 def on_pending_refresh():
-                    return _get_pending_receipts_data()
+                    new_choices = _get_pending_receipts_choices()
+                    new_has_pending = len(new_choices) > 0
+                    return (
+                        gr.update(choices=new_choices, value=None, visible=new_has_pending),
+                        gr.update(visible=new_has_pending),
+                        gr.update(visible=not new_has_pending),
+                        gr.update(visible=False),
+                        0, "other", "", "", 0, "✓ Refreshed - select a receipt"
+                    )
                 
                 refresh_pending_btn.click(
                     on_pending_refresh,
                     [],
-                    [pending_table],
+                    [pending_radio, instructions_msg, no_pending_msg, edit_form_group, selected_doc_id, edit_category, edit_vendor, edit_date, edit_total, status_msg],
                 )
+                
+                # Attach radio change handler always (will work when radio choices are populated)
+                pending_radio.change(
+                    on_radio_select,
+                    [pending_radio],
+                    [selected_doc_id, edit_category, edit_vendor, edit_date, edit_total, status_msg, edit_form_group],
+                )
+
 
     return demo
 

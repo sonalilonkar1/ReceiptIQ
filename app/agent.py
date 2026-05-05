@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 import json
+import re
 import time
 from pathlib import Path
 
@@ -33,7 +34,8 @@ from app.tools.db import (
     _connect,
 )
 from app.tools.vision import extract_fields_from_image, validate_totals
-from app.tools.web import web_lookup
+from app.tools.web import web_lookup, verify_vendor_online
+from app.tools.llm_parser import parse_receipt_text_with_llm
 
 try:
     from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
@@ -420,49 +422,19 @@ def _format_document(doc: dict) -> str:
     return formatted.strip()
 
 
-def _load_phi_model():
-    """Lazy load Phi-3.5-mini model for intent routing."""
-    global _PHI_MODEL, _PHI_TOKENIZER
-    if _PHI_MODEL is None:
-        _PHI_TOKENIZER = AutoTokenizer.from_pretrained(
-            "microsoft/Phi-3.5-mini-instruct",
-            trust_remote_code=True
-        )
-        _PHI_MODEL = AutoModelForCausalLM.from_pretrained(
-            "microsoft/Phi-3.5-mini-instruct",
-            device_map="auto",
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            trust_remote_code=True
-        )
-    return _PHI_MODEL, _PHI_TOKENIZER
-
-
-def _load_mistral_model():
-    """Lazy load Mistral-7B-Instruct model for complex reasoning."""
-    global _MISTRAL_MODEL, _MISTRAL_TOKENIZER
-    if _MISTRAL_MODEL is None:
-        _MISTRAL_TOKENIZER = AutoTokenizer.from_pretrained(
-            "mistralai/Mistral-7B-Instruct-v0.1",
-            trust_remote_code=True
-        )
-        _MISTRAL_MODEL = AutoModelForCausalLM.from_pretrained(
-            "mistralai/Mistral-7B-Instruct-v0.1",
-            device_map="auto",
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            trust_remote_code=True
-        )
-    return _MISTRAL_MODEL, _MISTRAL_TOKENIZER
-
-
-def _get_intent_with_llm(user_text: str) -> str:
-    """Use Phi-3.5-mini to determine user intent intelligently."""
-    if not _LLM_AVAILABLE:
-        return _route_intent_keywords(user_text)
-    
+def _get_intent_with_ollama(user_text: str) -> str:
+    """Use Ollama (Phi-3.5-mini) to determine user intent via HTTP API."""
     try:
-        model, tokenizer = _load_phi_model()
+        import requests
         
-        # Phi-3.5 uses instruction format
+        # Valid intents
+        valid_intents = [
+            "recent", "spend_by_vendor", "spending_by_category", "weekly_summary",
+            "monthly_summary", "pending_receipts", "duplicates", "missing_fields",
+            "threshold_search", "rule_violations", "compare_periods", "export_csv",
+            "average_spend", "keyword_search", "reimbursement", "web_lookup", "anomalies"
+        ]
+        
         intent_instruction = f"""You are an expense management AI assistant. Classify the user's intent into ONE of these categories:
 - recent: List recent receipts
 - spend_by_vendor: Analyze spending by vendor
@@ -486,52 +458,60 @@ User request: {user_text}
 
 Respond with ONLY the intent category (one word from the list above):"""
         
-        inputs = tokenizer(intent_instruction, return_tensors="pt")
-        if torch.cuda.is_available():
-            inputs = {k: v.cuda() for k, v in inputs.items()}
-        
-        # Generate with constraints
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=10,
-            temperature=0.3,
-            top_p=0.9,
+        # Call Ollama via HTTP API
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "phi",
+                "prompt": intent_instruction,
+                "stream": False,
+                "temperature": 0.3,
+            },
+            timeout=30
         )
         
-        response_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        if response.status_code != 200:
+            return _route_intent_keywords(user_text)
+        
+        try:
+            response_data = response.json()
+        except Exception:
+            response_data = None
+
+        if isinstance(response_data, dict):
+            response_text = str(response_data.get("response", "")).lower().strip()
+        else:
+            response_text = (response.text or "").lower().strip()
         
         # Extract intent from response
-        response_text = response_text.lower().split("respond with only")[-1].strip()
-        
-        # Valid intents
-        valid_intents = {
-            "recent", "spend_by_vendor", "spending_by_category", "weekly_summary",
-            "monthly_summary", "pending_receipts", "duplicates", "missing_fields",
-            "threshold_search", "rule_violations", "compare_periods", "export_csv",
-            "average_spend", "keyword_search", "reimbursement", "web_lookup", "anomalies"
-        }
-        
-        # Find the intent in response
         for intent in valid_intents:
             if intent in response_text:
                 return intent
         
-        return "unknown"
+        return _route_intent_keywords(user_text)
     
     except Exception:
-        # Fallback to keyword routing if LLM fails
+        # Fallback to keyword routing if Ollama fails or unavailable
         return _route_intent_keywords(user_text)
 
 
-def _analyze_with_mistral(user_text: str, context: str) -> str:
-    """Use Mistral-7B-Instruct for complex reasoning over context."""
-    if not _LLM_AVAILABLE:
-        return context
-    
+def _get_intent_with_llm(user_text: str) -> str:
+    """Route user intent - tries Ollama first, then falls back to keyword routing."""
+    # Try Ollama (HTTP API) first - much faster than loading model locally
     try:
-        model, tokenizer = _load_mistral_model()
+        return _get_intent_with_ollama(user_text)
+    except Exception:
+        pass
+    
+    # Fallback to keyword routing
+    return _route_intent_keywords(user_text)
+
+
+def _analyze_with_mistral(user_text: str, context: str) -> str:
+    """Use Ollama Mistral to analyze context - HTTP API approach."""
+    try:
+        import requests
         
-        # Mistral uses [INST] format
         instruction = f"""You are an expert expense management assistant. 
 User query: {user_text}
 
@@ -540,42 +520,36 @@ Database context:
 
 Provide a clear, concise analysis based on the data above."""
         
-        messages = [
-            {"role": "user", "content": instruction}
-        ]
-        
-        # Format for Mistral
-        inputs = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt"
-        )
-        if torch.cuda.is_available():
-            inputs = inputs.cuda()
-        
-        outputs = model.generate(
-            inputs,
-            max_new_tokens=256,
-            temperature=0.7,
-            top_p=0.9,
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "mistral",
+                "prompt": instruction,
+                "stream": False,
+                "temperature": 0.7,
+            },
+            timeout=30
         )
         
-        analysis = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        return analysis.split("Assistant:")[-1].strip() if "Assistant:" in analysis else analysis.strip()
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("response", "").strip()
     
     except Exception:
-        # Return context as-is if Mistral analysis fails
-        return context
+        pass
+    
+    # Return context as-is if analysis fails
+    return context
 
 
 def _plan_with_phi(user_text: str, tool_schema: str) -> Optional[dict]:
-    """Use Phi-3.5-mini to plan the query. Returns JSON with intent, db_queries, response_style."""
-    if not _LLM_AVAILABLE or not _get_planner_prompt():
+    """Use Ollama Phi to plan the query - HTTP API approach."""
+    if not _get_planner_prompt():
         return None
     
     try:
-        model, tokenizer = _load_phi_model()
+        import requests
+        
         planner_prompt = _get_planner_prompt()
         
         instruction = f"""{planner_prompt}
@@ -585,18 +559,29 @@ User query: {user_text}
 Tool schema:
 {tool_schema}"""
         
-        inputs = tokenizer(instruction, return_tensors="pt")
-        if torch.cuda.is_available():
-            inputs = {k: v.cuda() for k, v in inputs.items()}
-        
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=256,
-            temperature=0.3,
-            top_p=0.9,
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "phi",
+                "prompt": instruction,
+                "stream": False,
+                "temperature": 0.3,
+            },
+            timeout=30
         )
         
-        response_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        if response.status_code != 200:
+            return None
+
+        try:
+            data = response.json()
+        except Exception:
+            data = None
+
+        if isinstance(data, dict):
+            response_text = str(data.get("response", ""))
+        else:
+            response_text = response.text or ""
         
         # Extract JSON from response
         json_start = response_text.find("{")
@@ -613,12 +598,9 @@ Tool schema:
 
 
 def _write_answer_with_mistral(user_text: str, db_results: str) -> Optional[str]:
-    """Use Mistral-7B-Instruct to write the final answer based on DB results."""
-    if not _LLM_AVAILABLE:
-        return None
-    
+    """Use Ollama Mistral to write the final answer - HTTP API approach."""
     try:
-        model, tokenizer = _load_mistral_model()
+        import requests
         
         instruction = f"""You are ReceiptIQ, an expense management assistant. 
 User query: {user_text}
@@ -628,41 +610,42 @@ Database results:
 
 Provide a clear, concise answer based on the data above. Always cite document IDs (doc_id) when referencing receipts. Never hallucinate data."""
         
-        messages = [
-            {"role": "user", "content": instruction}
-        ]
-        
-        inputs = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt"
-        )
-        if torch.cuda.is_available():
-            inputs = inputs.cuda()
-        
-        outputs = model.generate(
-            inputs,
-            max_new_tokens=512,
-            temperature=0.7,
-            top_p=0.9,
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "mistral",
+                "prompt": instruction,
+                "stream": False,
+                "temperature": 0.7,
+            },
+            timeout=30
         )
         
-        answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        return answer.split("Assistant:")[-1].strip() if "Assistant:" in answer else answer.strip()
+        if response.status_code == 200:
+            try:
+                result = response.json()
+            except Exception:
+                result = None
+
+            if isinstance(result, dict):
+                return str(result.get("response", "")).strip()
+            else:
+                return (response.text or "").strip()
     
     except Exception:
-        return None
+        pass
+    
+    return None
 
 
 def _verify_answer_with_phi(draft_answer: str, tool_results: str) -> Optional[dict]:
-    """Use Phi-3.5-mini to verify the answer. Returns JSON with is_supported, issues, revised_answer."""
-    if not _LLM_AVAILABLE or not _get_verifier_prompt():
+    """Use Ollama Phi to verify the answer - HTTP API approach."""
+    verifier_prompt = _get_verifier_prompt()
+    if not verifier_prompt:
         return None
     
     try:
-        model, tokenizer = _load_phi_model()
-        verifier_prompt = _get_verifier_prompt()
+        import requests
         
         instruction = f"""{verifier_prompt}
 
@@ -671,18 +654,29 @@ Draft Answer: {draft_answer}
 Tool Output:
 {tool_results}"""
         
-        inputs = tokenizer(instruction, return_tensors="pt")
-        if torch.cuda.is_available():
-            inputs = {k: v.cuda() for k, v in inputs.items()}
-        
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=256,
-            temperature=0.3,
-            top_p=0.9,
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "phi",
+                "prompt": instruction,
+                "stream": False,
+                "temperature": 0.3,
+            },
+            timeout=30
         )
         
-        response_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        if response.status_code != 200:
+            return None
+
+        try:
+            data = response.json()
+        except Exception:
+            data = None
+
+        if isinstance(data, dict):
+            response_text = str(data.get("response", ""))
+        else:
+            response_text = response.text or ""
         
         # Extract JSON from response
         json_start = response_text.find("{")
@@ -699,16 +693,9 @@ Tool Output:
 
 
 def _rewrite_with_mistral(formatted_output: str, user_query: str, intent: str) -> Optional[str]:
-    """Use Mistral to rewrite formatter output as natural language while preserving citations.
-    
-    Takes structured formatter output (like _format_spend_by_vendor) and rewrites it
-    using Mistral for better readability, while ensuring doc_id citations remain intact.
-    """
-    if not _LLM_AVAILABLE:
-        return formatted_output
-    
+    """Use Ollama Mistral to rewrite formatter output as natural language - HTTP API approach."""
     try:
-        model, tokenizer = _load_mistral_model()
+        import requests
         
         instruction = f"""You are ReceiptIQ, an expense management assistant. 
 User asked: {user_query}
@@ -722,40 +709,44 @@ IMPORTANT: Keep ALL document IDs (doc_id: X) and citations exactly as they appea
 Make it more engaging and easier to understand while preserving all data accuracy.
 Keep formatting clean and organized."""
         
-        messages = [
-            {"role": "user", "content": instruction}
-        ]
-        
-        inputs = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt"
-        )
-        if torch.cuda.is_available():
-            inputs = inputs.cuda()
-        
-        outputs = model.generate(
-            inputs,
-            max_new_tokens=512,
-            temperature=0.7,
-            top_p=0.9,
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "mistral",
+                "prompt": instruction,
+                "stream": False,
+                "temperature": 0.7,
+            },
+            timeout=30
         )
         
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        rewritten = response.split("Assistant:")[-1].strip() if "Assistant:" in response else response.strip()
-        
-        # Ensure citations are preserved
-        if "doc_id" in formatted_output and "doc_id" not in rewritten:
-            # Fallback if Mistral drops citations
-            rewritten += f"\n\n_Data source: {formatted_output.split('DB:')[-1] if 'DB:' in formatted_output else 'Database'}_"
-        
-        return rewritten if rewritten else formatted_output
+        if response.status_code == 200:
+            try:
+                result = response.json()
+            except Exception:
+                result = None
+
+            if isinstance(result, dict):
+                rewritten = str(result.get("response", "")).strip()
+            else:
+                rewritten = (response.text or "").strip()
+            
+            # Ensure citations are preserved
+            if "doc_id" in formatted_output and "doc_id" not in rewritten:
+                # Fallback if Mistral drops citations
+                rewritten += f"\n\n_Data source: {formatted_output.split('DB:')[-1] if 'DB:' in formatted_output else 'Database'}_"
+            
+            return rewritten if rewritten else formatted_output
     
     except Exception:
-        # Fallback to original formatted output on error
-        return formatted_output
-    """Fallback keyword-based routing when Phi-3.5-mini is unavailable."""
+        pass
+    
+    # Fallback to original formatted output on error
+    return formatted_output
+
+
+def _route_intent_keywords(user_text: str) -> str:
+    """Fallback keyword-based routing when Ollama is unavailable."""
     text = user_text.lower()
 
     if "duplicate" in text:
@@ -970,6 +961,117 @@ def security_guard(user_text: str) -> Optional[dict]:
     return None
 
 
+def _parse_receipt_with_llm_fallback(raw_text: str, model: str = "phi") -> dict:
+    """Parse receipt OCR text with LLM, falling back to regex if LLM fails.
+    
+    Args:
+        raw_text: OCR-extracted receipt text
+        model: "phi" (default, faster) or "mistral" (more capable)
+    
+    Returns dict compatible with _to_document_payload:
+    {
+        "vendor": str or None,
+        "date": str (YYYY-MM-DD) or None,
+        "subtotal": float or None,
+        "tax": float or None,
+        "total": float or None,
+        "currency": str,
+        "category": str,
+        "invoice_number": str or None,
+        "line_items": str or None,
+        "raw_text": str,
+        "doc_type": "receipt",
+        "confidence_overall": float,
+        "llm_confidence": dict with per-field confidence scores
+    }
+    """
+    # Primary: LLM parsing
+    llm_result = parse_receipt_text_with_llm(raw_text, model=model.lower())
+    
+    # Extract values from LLM result (structure: {field: {value, confidence, evidence_line}})
+    vendor = llm_result.get("vendor", {}).get("value")
+    date = llm_result.get("date", {}).get("value")
+    subtotal = llm_result.get("subtotal", {}).get("value")
+    tax = llm_result.get("tax", {}).get("value")
+    total = llm_result.get("total", {}).get("value")
+    currency = llm_result.get("currency", {}).get("value") or "USD"
+    category = llm_result.get("category", {}).get("value") or "other"
+    invoice_number = llm_result.get("invoice_number", {}).get("value")
+    line_items = llm_result.get("line_items", {}).get("value")
+    
+    # Collect per-field confidence scores
+    llm_confidence = {
+        "vendor": llm_result.get("vendor", {}).get("confidence", 0.0),
+        "date": llm_result.get("date", {}).get("confidence", 0.0),
+        "total": llm_result.get("total", {}).get("confidence", 0.0),
+        "subtotal": llm_result.get("subtotal", {}).get("confidence", 0.0),
+        "tax": llm_result.get("tax", {}).get("confidence", 0.0),
+    }
+    
+    # Fallback to regex if critical fields are missing or LLM confidence too low
+    if not vendor or llm_confidence.get("vendor", 0) < 0.5:
+        # Try regex fallback for vendor
+        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+        from app.tools.vision import _guess_vendor
+        vendor_guess = _guess_vendor(lines)
+        if vendor_guess and not vendor:
+            vendor = vendor_guess
+            llm_confidence["vendor"] = 0.3  # Lower confidence for regex fallback
+    
+    if not date or llm_confidence.get("date", 0) < 0.5:
+        # Try regex fallback for date
+        from app.tools.vision import _extract_date
+        date_guess = _extract_date(raw_text)
+        if date_guess and not date:
+            date = date_guess
+            llm_confidence["date"] = 0.3
+    
+    if not total or llm_confidence.get("total", 0) < 0.5:
+        # Try regex fallback for total
+        from app.tools.vision import _find_amount_by_labels, _find_max_amount
+        total_guess = _find_amount_by_labels(raw_text, ["total", "amount due", "balance due", "grand total"])
+        if not total_guess:
+            total_guess = _find_max_amount(raw_text)
+        if total_guess and not total:
+            total = total_guess
+            llm_confidence["total"] = 0.3
+    
+    # Format line_items for database (string with items separated by |)
+    line_items_str = None
+    if line_items:
+        if isinstance(line_items, list):
+            line_items_str = "|".join(str(item) for item in line_items[:10])
+        else:
+            line_items_str = str(line_items)
+    
+    # Calculate overall confidence (weighted average of critical fields)
+    overall_confidence = (
+        llm_confidence.get("vendor", 0) * 0.25 +
+        llm_confidence.get("date", 0) * 0.25 +
+        llm_confidence.get("total", 0) * 0.25 +
+        llm_confidence.get("subtotal", 0) * 0.125 +
+        llm_confidence.get("tax", 0) * 0.125
+    )
+    
+    return {
+        "doc_type": "receipt",
+        "vendor": vendor,
+        "date": date,
+        "currency": currency,
+        "subtotal": subtotal,
+        "tax": tax,
+        "total": total,
+        "category": category,
+        "invoice_number": invoice_number,
+        "line_items": line_items_str,
+        "description": f"Receipt from {vendor}" if vendor else "Receipt",
+        "raw_text": raw_text,
+        "confidence_overall": round(overall_confidence, 2),
+        "llm_confidence": llm_confidence,
+        "llm_error": llm_result.get("error"),
+    }
+
+
 def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
     """Handle user requests with either file extraction or keyword-based routing."""
     import re
@@ -1000,13 +1102,24 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
             return {"response": response, "citations": citations, "debug": debug}
 
     if file_path:
-        extracted = extract_fields_from_image(file_path)
+        # Step 1: Extract raw OCR text from image
+        ocr_result = extract_fields_from_image(file_path)
+        raw_text = ocr_result.get("raw_text", "")
+        
+        # Step 2: Parse with LLM + fallback to regex
+        extracted = _parse_receipt_with_llm_fallback(raw_text)
+        
+        # Add OCR metadata
+        extracted["vendor_guess"] = ocr_result.get("vendor_guess")
+        
         db_payload = _to_document_payload(extracted)
         doc_id = insert_document(db_payload)
         citations.append(f"DB:documents.doc_id={doc_id}")
 
         mismatch = validate_totals(extracted)
         debug["validation"] = mismatch
+        debug["llm_confidence"] = extracted.get("confidence_overall")
+        debug["llm_error"] = extracted.get("llm_error")
 
         flagged = False
         if mismatch:
@@ -1517,44 +1630,56 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
         return {"response": response, "citations": citations, "debug": debug}
 
     if intent == "vendor_verification" or "verify" in user_text.lower():
-        # Extract vendor name from query
-        import re as re_module
-        vendor_match = re_module.search(r"(?:verify|check)\s+(?:vendor|company)?\s*(.+?)(?:\s+|$)", user_text, re.IGNORECASE)
-        vendor_name = vendor_match.group(1).strip() if vendor_match else None
-        
-        if vendor_name:
-            result = verify_vendor(vendor_name)
-            debug["vendor_result"] = result
-            
-            status = "✓ Verified" if result["verified"] else "✗ Not Verified"
-            response = f"""🏢 **Vendor Verification: {result['vendor']}**
+        # Better vendor extraction: keep everything after "verify vendor" / "verify"
+        text = user_text.strip()
 
-**Status:** {status}
-**Type:** {result['type']}
-**Website:** {result.get('website', 'N/A')}
-**Confidence:** {result.get('confidence', 0)*100:.0f}%"""
-            
-            if result.get("note"):
-                response += f"\n**Note:** {result['note']}"
-            
-            citations.append("WEB:vendor_registry")
+        vendor_name = None
+        for prefix in ["verify vendor", "verify", "official site for", "website for", "check vendor", "check company"]:
+            idx = text.lower().find(prefix)
+            if idx != -1:
+                vendor_name = text[idx + len(prefix):].strip(" :,-")
+                break
+
+        # Fallback: try regex (your old one)
+        if not vendor_name:
+            vendor_match = re.search(r"(?:verify|check)\s+(?:vendor|company)?\s*(.+)", text, re.IGNORECASE)
+            vendor_name = vendor_match.group(1).strip() if vendor_match else None
+
+        if not vendor_name or len(vendor_name) < 2:
+            response = "Please specify which vendor to verify (e.g., 'Verify vendor Domino\\'s')"
+            return {"response": response, "citations": citations, "debug": debug}
+
+        result = verify_vendor_online(vendor_name)
+        debug["vendor_result"] = result
+
+        # Format response
+        response = f"🏢 **Vendor Verification: {vendor_name}**\n\n"
+
+        if result.get("error"):
+            response += f"**Status:** ✗ Not Verified\n**Error:** {result['error']}\n"
+            citations.append("WEB:duckduckgo_html")
+            return {"response": response, "citations": citations, "debug": debug}
+
+        best = result.get("best_guess_official")
+        confidence = result.get("confidence", 0.0)
+        response += f"**Confidence:** {confidence*100:.0f}%\n"
+        if result.get("note"):
+            response += f"**Note:** {result['note']}\n"
+
+        if best:
+            response += f"\n✅ **Best guess official site:** {best.get('domain')} — {best.get('url')}\n"
         else:
-            response = "Please specify which vendor to verify (e.g., 'Verify McDonald's')"
-        
-        return {"response": response, "citations": citations, "debug": debug}
+            response += "\n⚠️ **Best guess official site:** Not confident enough to pick one.\n"
 
-    response = (
-        "I can help with:\\n"
-        "• Process receipt images\\n"
-        "• List recent receipts\\n"
-        "• Analyze spending by vendor or category\\n"
-        "• Find duplicate receipts\\n"
-        "• Search by amount threshold\\n"
-        "• Check expense rule violations\\n"
-        "• Detect anomalies in expenses\\n"
-        "• Verify vendor information\\n"
-        "• Export receipts as CSV\\n"
-        "• Currency conversion\\n"
-        "• And more! Try asking specific questions about your expenses."
-    )
-    return {"response": response, "citations": citations, "debug": debug}
+        response += "\n**Top results:**\n"
+        for i, r in enumerate(result.get("results", [])[:3], start=1):
+            response += f"{i}. {r.get('title')} — {r.get('domain')} — {r.get('url')}\n"
+
+        # Citations: include real URLs for slide credibility
+        if best and best.get("url"):
+            citations.append(best["url"])
+        for r in result.get("results", [])[:3]:
+            if r.get("url"):
+                citations.append(r["url"])
+
+        return {"response": response, "citations": citations, "debug": debug}

@@ -10,6 +10,8 @@ from PIL import Image, ImageOps, ImageFilter
 import pytesseract
 
 
+
+
 _DATE_REGEX = re.compile(
     r"\b(?:"
     r"\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4}"
@@ -131,16 +133,79 @@ def _find_amount_by_labels(raw_text: str, labels: list[str]) -> Optional[float]:
 
 
 def _guess_vendor(lines: list[str]) -> Optional[str]:
-    for line in lines[:8]:
+    """Extract vendor name from receipt, prioritizing brand names over service types.
+    
+    Strategy:
+    1. Skip obvious service types and annotations
+    2. Prefer multi-word candidates (real brands are often 2+ words)
+    3. Skip single words that look like OCR errors
+    4. Skip lines with timestamps, codes, or common receipt metadata
+    5. Look through more lines to find actual brand names
+    """
+    # Skip tokens that indicate service type, not vendor name
+    skip_tokens = (
+        "receipt", "invoice", "tax", "date", "total", "subtotal",
+        "carry-out", "carry out", "carryout", "dine-in", "dine in", "dining",
+        "takeout", "take out", "delivery", "order", "not paid", "paid",
+        "server", "table", "check", "bill", "tip", "save", "email", "website"
+    )
+    
+    # Metadata keywords to skip when they're the first word
+    metadata_first_words = (
+        "order", "server", "table", "ref", "id", "store", "location", "address",
+        "street", "city", "state", "zip", "phone", "register", "terminal"
+    )
+    
+    candidates = []
+    
+    # Look through first 20 lines
+    for line in lines[:20]:
         candidate = re.sub(r"[^A-Za-z0-9&.,'\- ]+", "", line).strip()
         if len(candidate) < 3:
             continue
         lowered = candidate.lower()
-        if any(token in lowered for token in ("receipt", "invoice", "tax", "date", "total", "subtotal")):
+        
+        # Skip known service types/annotations
+        if any(token in lowered for token in skip_tokens):
             continue
-        if re.search(r"\d", candidate) and len(candidate.split()) <= 2:
+        
+        # Skip if contains common codes/IDs (all uppercase + numbers, like "KRV4BFHZ")
+        if re.match(r"^[A-Z0-9]{5,}$", candidate):
             continue
-        return candidate
+        
+        # Skip pure phone/numbers
+        if re.match(r"^\+?\d[\d\-\(\)\s]{5,}$", candidate):
+            continue
+        
+        # Skip if starts with a number (likely an address like "123 Main St")
+        if candidate[0].isdigit():
+            continue
+        
+        # Skip if starts with metadata keyword
+        first_word = candidate.split()[0].lower()
+        if first_word in metadata_first_words:
+            continue
+        
+        # Skip lines that are mostly numbers/single words with numbers (like "Order 1065860")
+        if re.search(r"\d", candidate):
+            word_count = len(candidate.split())
+            if word_count <= 1:
+                continue
+        
+        # Remove trailing store/location numbers (4-5 digits: "Domino's Pizza 3693" -> "Domino's Pizza")
+        candidate_clean = re.sub(r'\s+\d{4,5}$', '', candidate).strip()
+        if not candidate_clean:
+            candidate_clean = candidate
+        
+        # Collect candidate with word count (prefer multi-word names)
+        word_count = len(candidate_clean.split())
+        candidates.append((word_count, len(candidate_clean), candidate_clean))
+    
+    # Sort by word count (prefer 2+ words), then by length (prefer longer names)
+    if candidates:
+        candidates.sort(key=lambda x: (-x[0], -x[1]))
+        return candidates[0][2]
+    
     return None
 
 
@@ -227,9 +292,10 @@ def _extract_invoice_number(raw_text: str) -> Optional[str]:
 
 
 def extract_fields_from_image(image_path: str) -> dict:
-    """Run OCR and extract key receipt fields into a dictionary.
+    """Run OCR on receipt image and return raw text.
     
-    Enhanced with image preprocessing, regional OCR, and fallback logic for crumpled receipts.
+    All field extraction is handled by parse_receipt_text_with_llm in llm_parser.py.
+    This function focuses only on image preprocessing and OCR.
     """
     image = Image.open(Path(image_path)).convert("RGB")
     
@@ -243,54 +309,24 @@ def extract_fields_from_image(image_path: str) -> dict:
     # OCR full image with enhanced config
     raw_text = pytesseract.image_to_string(preprocessed, config="--oem 3 --psm 6")
     
-    # Optional: OCR top 25% for vendor/date (more reliable for header regions)
+    # Optional: OCR regions for better accuracy on specific parts
     top_text = _ocr_region(preprocessed, top_percent=0.0, bottom_percent=0.25)
-    # Optional: OCR bottom 35% for totals (more reliable for footer regions)
     bottom_text = _ocr_region(preprocessed, top_percent=0.65, bottom_percent=1.0)
     
-    # Combine texts for comprehensive search
+    # Combine all OCR results
     combined_text = raw_text + "\n" + top_text + "\n" + bottom_text
-
+    
     lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
-
-    vendor = _guess_vendor(lines)
-    date = _extract_date(combined_text)
-    subtotal = _find_amount_by_labels(combined_text, ["subtotal", "sub total"])
-    tax = _find_amount_by_labels(combined_text, ["tax", "vat", "gst", "sales tax"])
-    total = _find_amount_by_labels(combined_text, ["total", "amount due", "balance due", "grand total"])
     
-    # Fallback: if total is None, use maximum amount from text
-    if total is None:
-        total = _find_max_amount(raw_text)
-    
-    category = _classify_category(vendor, raw_text)
-    line_items = _extract_line_items(raw_text)
-    invoice_number = _extract_invoice_number(raw_text)
+    # Simple vendor guess (optional, for reference)
+    vendor_guess = _guess_vendor(lines)
 
-    extracted = {
+    return {
         "doc_type": "receipt",
-        "vendor": vendor,
-        "date": date,
-        "currency": "USD",
-        "subtotal": subtotal,
-        "tax": tax,
-        "total": total,
-        "category": category,
-        "line_items": line_items,
-        "invoice_number": invoice_number,
-        "description": f"Receipt from {vendor}" if vendor else "Receipt",
-        "raw_text": raw_text,
+        "raw_text": combined_text,  # Comprehensive OCR text
+        "vendor_guess": vendor_guess,  # Optional simple guess
+        "description": f"Receipt from {vendor_guess}" if vendor_guess else "Receipt",
     }
-
-    score = 0
-    score += 1 if vendor else 0
-    score += 1 if date else 0
-    score += 1 if subtotal is not None else 0
-    score += 1 if tax is not None else 0
-    score += 1 if total is not None else 0
-    extracted["confidence_overall"] = round(score / 5.0, 2)
-
-    return extracted
 
 
 def validate_totals(extracted: dict) -> Optional[str]:
