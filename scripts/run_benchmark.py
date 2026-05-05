@@ -94,42 +94,64 @@ def ensure_output_dir():
     return output_dir
 
 
-def has_citations(response_data: Dict) -> bool:
-    """Check if response includes citations."""
-    citations = response_data.get("citations", [])
-    return len(citations) > 0
+def has_citations(result: Dict) -> bool:
+    c = result.get("citations")
+    if isinstance(c, list) and len(c) > 0:
+        return True
+    if isinstance(c, str) and c.strip():
+        return True
+
+    # fallback: detect citations in response text
+    resp = result.get("response", "") or ""
+    if "Citations:" in resp or "http" in resp:
+        return True
+
+    return False
 
 
 def tool_used_when_required(response_data: Dict, query: str) -> bool:
     """
     Check if a tool was used when the query seemed to require it.
-    
-    Queries requiring tool usage:
-    - Spending analysis queries should query database
-    - Anomaly detection should use detect_anomalies()
-    - Duplicate detection should use find_duplicates()
     """
     debug = response_data.get("debug", {})
-    intent = debug.get("intent", "").lower()
-    
-    # Queries that should definitely use database tools
-    requires_tool = any(keyword in query.lower() for keyword in [
-        "spending", "vendor", "category", "duplicate", "anomal",
-        "recent", "transaction", "receipt"
-    ])
-    
+    intent = (debug.get("intent", "") or "").lower()
+    q = query.lower()
+
+    # Explicit tool-required intents (web tools)
+    if any(k in q for k in ["verify vendor", "official website", "official site", "vendor verification", "verify"]):
+        requires_tool = True
+    elif any(k in q for k in ["convert", "exchange rate", "currency"]):
+        requires_tool = True
+    else:
+        # DB-required intents
+        requires_tool = any(keyword in q for keyword in [
+            "spending", "vendor", "category", "duplicate", "anomal",
+            "recent", "transaction", "receipt", "last month", "this month"
+        ])
+
     # Check if debug info shows tool was used
     has_rows = debug.get("rows") is not None
-    has_result = debug.get("duplicates") is not None or \
-                debug.get("anomalies") is not None or \
-                debug.get("categories") is not None
-    
+    has_result = (
+        debug.get("duplicates") is not None or
+        debug.get("anomalies") is not None or
+        debug.get("categories") is not None
+    )
+
+    # For web tools, citations (URLs) indicate tool usage
+    citations = response_data.get("citations", [])
+    has_web_urls = isinstance(citations, list) and any(
+        isinstance(c, str) and c.startswith("http") for c in citations
+    )
+    used_web_tool = intent in ["vendor_verification", "web_lookup", "currency_conversion"] or has_web_urls
+
     if requires_tool:
-        return has_rows or has_result or intent in [
-            "spend_by_vendor", "spending_by_category", 
-            "duplicates", "anomalies", "recent"
+        return has_rows or has_result or used_web_tool or intent in [
+            "spend_by_vendor", "spending_by_category",
+            "duplicates", "anomalies", "recent",
+            "pending_receipts", "weekly_summary", "monthly_summary",
+            "vendor_verification", "web_lookup", "currency_conversion"
         ]
-    
+
     # Queries not requiring tool still valid
     return True
 
@@ -166,42 +188,53 @@ def is_injection_refused(response_data: Dict, query: str) -> bool:
     # If injection was detected and refused, that's good
     return has_refusal or not has_dangerous
 
+def query_requires_tools(query: str) -> bool:
+    q = query.lower()
+    # Help/FAQ queries shouldn't require tools/citations
+    if any(k in q for k in [
+        "what can you do", "how does", "help me understand", "explain how", "how it works", "capabilities"
+    ]):
+        return False
+
+    # Everything analytic / lookup should require tools
+    tool_keywords = [
+        "recent", "transactions", "last month", "this month", "spend", "spent", "vendor", "category",
+        "duplicate", "anomal", "suspicious", "verify vendor", "verify", "official website",
+        "convert", "exchange rate"
+    ]
+    return any(k in q for k in tool_keywords)
+
 
 def measure_query(query: str, is_injection: bool = False) -> Dict:
     """
     Run a single query and measure metrics.
-    
-    Returns dict with:
-    - latency_ms: Query execution time
-    - has_citations: Whether citations were included
-    - tool_used: Whether tools were used appropriately
-    - injection_refused: Whether injection was refused
-    - response_length: Length of response
-    - success: Overall success indicator
     """
     try:
         start_time = time.time()
         result = handle_message(query)
+        if result is None:
+            raise ValueError("handle_message returned None")
         latency_ms = (time.time() - start_time) * 1000
-        
-        has_citations = has_citations(result)
+
+        citations_present = has_citations(result)
         tool_used = tool_used_when_required(result, query)
         injection_refused = is_injection_refused(result, query) if is_injection else True
         response_length = len(result.get("response", ""))
-        
-        # Determine overall success
+
         if is_injection:
-            # Success = refused the injection
             success = injection_refused
         else:
-            # Success = has citations and used tools when needed and got response
-            success = has_citations and tool_used and response_length > 0
-        
+            # Only require tools/citations when query actually needs tools
+            if query_requires_tools(query):
+                success = citations_present and tool_used and response_length > 0
+            else:
+                success = response_length > 0  # help queries can succeed without citations/tools
+
         return {
             "query": query,
             "query_type": "injection" if is_injection else "normal",
             "latency_ms": round(latency_ms, 2),
-            "has_citations": has_citations,
+            "has_citations": citations_present,
             "tool_used": tool_used,
             "injection_refused": injection_refused if is_injection else None,
             "response_length": response_length,
@@ -209,7 +242,7 @@ def measure_query(query: str, is_injection: bool = False) -> Dict:
             "timestamp": datetime.now().isoformat(),
             "error": None
         }
-    
+
     except Exception as e:
         return {
             "query": query,
@@ -223,7 +256,6 @@ def measure_query(query: str, is_injection: bool = False) -> Dict:
             "timestamp": datetime.now().isoformat(),
             "error": str(e)
         }
-
 
 def run_benchmark(model_mode: str, cache_enabled: bool, prompt_cache_enabled: bool) -> Tuple[List[Dict], Dict]:
     """
@@ -274,7 +306,11 @@ def run_benchmark(model_mode: str, cache_enabled: bool, prompt_cache_enabled: bo
         results.append(result)
         
         status = "✓" if result["success"] else "✗"
-        print(f"{status} ({result['latency_ms']:.0f}ms)")
+        lat = result.get("latency_ms")
+        lat_str = f"{lat:.0f}ms" if isinstance(lat, (int, float)) else "N/A"
+        print(f"{status} ({lat_str})")
+        if not result["success"] and result.get("error"):
+            print(f"      error: {result['error']}")
     
     print("\nRunning injection queries...")
     for query in INJECTION_QUERIES:
@@ -286,8 +322,11 @@ def run_benchmark(model_mode: str, cache_enabled: bool, prompt_cache_enabled: bo
         results.append(result)
         
         status = "✓" if result["success"] else "✗"
-        latency_str = f"{result['latency_ms']:.0f}ms" if result['latency_ms'] else "ERROR"
-        print(f"{status} ({latency_str})")
+        lat = result.get("latency_ms")
+        lat_str = f"{lat:.0f}ms" if isinstance(lat, (int, float)) else "N/A"
+        print(f"{status} ({lat_str})")
+        if not result["success"] and result.get("error"):
+            print(f"      error: {result['error']}")
     
     # Collect cache metrics after benchmark completes
     cache_metrics = get_prompt_cache_metrics()

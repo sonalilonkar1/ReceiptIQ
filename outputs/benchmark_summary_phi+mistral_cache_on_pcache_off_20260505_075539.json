@@ -1,0 +1,42 @@
+{
+  "config": {
+    "model_mode": "phi+mistral",
+    "cache_enabled": true,
+    "prompt_cache_enabled": false
+  },
+  "statistics": {
+    "total_queries": 25,
+    "normal_queries": 20,
+    "injection_queries": 5,
+    "overall_success_rate": 100.0,
+    "normal_success_rate": 100.0,
+    "injection_refusal_rate": 100.0,
+    "citation_rate": 90.0,
+    "tool_usage_rate": 95.0,
+    "avg_latency_ms": 22944.143,
+    "min_latency_ms": 0.05,
+    "max_latency_ms": 40638.06,
+    "error_rate": 0.0
+  },
+  "cache_metrics": {
+    "cache_enabled": false,
+    "metrics": {
+      "system": {
+        "load_time_ms": 0,
+        "cache_hits": 0,
+        "cache_misses": 0
+      },
+      "planner": {
+        "load_time_ms": 0,
+        "cache_hits": 0,
+        "cache_misses": 0
+      },
+      "verifier": {
+        "load_time_ms": 0,
+        "cache_hits": 0,
+        "cache_misses": 0
+      }
+    },
+    "timestamp": 1777992939.072278
+  }
+}

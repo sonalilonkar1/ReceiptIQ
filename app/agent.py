@@ -179,6 +179,15 @@ def reset_prompt_cache():
         "verifier": {"load_time_ms": 0, "cache_hits": 0, "cache_misses": 0},
     }
 
+def _wrap_response(response: str, citations: list[str], debug: dict, success: bool = True, error: str | None = None) -> dict:
+    """Standardize response object for benchmark compatibility."""
+    out = {"response": response, "citations": citations, "debug": debug, "success": success}
+    # Prefer debug latency if set
+    out["latency_ms"] = debug.get("latency_ms")
+    if error:
+        out["error"] = error
+        out["success"] = False
+    return out
 
 def _format_recent_docs(rows: list[tuple]) -> str:
     """Format recent documents for display.
@@ -432,7 +441,7 @@ def _get_intent_with_ollama(user_text: str) -> str:
             "recent", "spend_by_vendor", "spending_by_category", "weekly_summary",
             "monthly_summary", "pending_receipts", "duplicates", "missing_fields",
             "threshold_search", "rule_violations", "compare_periods", "export_csv",
-            "average_spend", "keyword_search", "reimbursement", "web_lookup", "anomalies"
+            "average_spend", "keyword_search", "reimbursement", "web_lookup", "anomalies", "vendor_verification"
         ]
         
         intent_instruction = f"""You are an expense management AI assistant. Classify the user's intent into ONE of these categories:
@@ -453,7 +462,7 @@ def _get_intent_with_ollama(user_text: str) -> str:
 - reimbursement: Create reimbursement summaries
 - web_lookup: Convert currency or lookup vendor info
 - anomalies: Detect suspicious/anomalous receipts
-
+- vendor_verification: Verify vendor information
 User request: {user_text}
 
 Respond with ONLY the intent category (one word from the list above):"""
@@ -462,7 +471,7 @@ Respond with ONLY the intent category (one word from the list above):"""
         response = requests.post(
             "http://localhost:11434/api/generate",
             json={
-                "model": "phi",
+                "model": "phi3.5",
                 "prompt": intent_instruction,
                 "stream": False,
                 "temperature": 0.3,
@@ -562,7 +571,7 @@ Tool schema:
         response = requests.post(
             "http://localhost:11434/api/generate",
             json={
-                "model": "phi",
+                "model": "phi3.5",
                 "prompt": instruction,
                 "stream": False,
                 "temperature": 0.3,
@@ -657,7 +666,7 @@ Tool Output:
         response = requests.post(
             "http://localhost:11434/api/generate",
             json={
-                "model": "phi",
+                "model": "phi3.5",
                 "prompt": instruction,
                 "stream": False,
                 "temperature": 0.3,
@@ -1071,7 +1080,6 @@ def _parse_receipt_with_llm_fallback(raw_text: str, model: str = "phi") -> dict:
         "llm_error": llm_result.get("error"),
     }
 
-
 def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
     """Handle user requests with either file extraction or keyword-based routing."""
     import re
@@ -1164,7 +1172,34 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
         debug["missing_fields"] = missing_fields
         return {"response": response, "citations": citations, "debug": debug}
 
-    intent = _route_intent(user_text)
+    # Fast-path routing for common DB queries (avoids Ollama misclassification + improves latency)
+    text_l = user_text.lower()
+
+    if ("recent" in text_l and ("receipt" in text_l or "transaction" in text_l)) or ("show me all my receipts" in text_l):
+        intent = "recent"
+    elif "last month" in text_l and ("receipt" in text_l or "transaction" in text_l):
+        intent = "recent"
+    elif ("spend" in text_l or "spent" in text_l) and ("vendor" in text_l or "merchant" in text_l):
+        intent = "spend_by_vendor"
+    elif "category" in text_l and ("spend" in text_l or "spending" in text_l):
+        intent = "spending_by_category"
+    elif "duplicate" in text_l:
+        intent = "duplicates"
+    elif "anomal" in text_l or "unusual" in text_l or "suspicious" in text_l:
+        intent = "anomalies"
+    elif "pending" in text_l:
+        intent = "pending_receipts"
+    elif "weekly" in text_l:
+        intent = "weekly_summary"
+    elif "monthly" in text_l:
+        intent = "monthly_summary"
+    elif "convert" in text_l or "exchange rate" in text_l:
+        intent = "web_lookup"
+    elif "verify" in text_l and "vendor" in text_l:
+        intent = "vendor_verification"
+    else:
+        intent = _route_intent(user_text)
+
     debug["intent"] = intent
 
     if intent == "recent":
@@ -1194,7 +1229,7 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
         debug["rows"] = rows if 'rows' in locals() else None
         debug["latency_ms"] = round((time.time() - start_time) * 1000, 2)
         citations.append("DB:documents")
-        return {"response": response, "citations": citations, "debug": debug}
+        return _wrap_response(response, citations, debug, success=True)
 
     if intent == "spend_by_vendor":
         start_time = time.time()
@@ -1266,7 +1301,7 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
         debug["rows"] = rows if 'rows' in locals() else None
         debug["latency_ms"] = round((time.time() - start_time) * 1000, 2)
         citations.append("DB:documents")
-        return {"response": response, "citations": citations, "debug": debug}
+        return _wrap_response(response, citations, debug, success=True)
 
     if intent == "duplicates":
         start_time = time.time()
@@ -1295,7 +1330,7 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
         debug["rows"] = rows if 'rows' in locals() else None
         debug["latency_ms"] = round((time.time() - start_time) * 1000, 2)
         citations.append("DB:documents")
-        return {"response": response, "citations": citations, "debug": debug}
+        return _wrap_response(response, citations, debug, success=True)
 
     if intent == "web_lookup":
         web_result = web_lookup(user_text)
@@ -1310,7 +1345,7 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
             response = web_result.get("note", "Web lookup completed.")
         
         citations.append("WEB:currency_api")
-        return {"response": response, "citations": citations, "debug": debug}
+        return _wrap_response(response, citations, debug, success=True)
 
     if intent == "spending_by_category":
         start_time = time.time()
@@ -1339,7 +1374,7 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
         debug["rows"] = rows if 'rows' in locals() else None
         debug["latency_ms"] = round((time.time() - start_time) * 1000, 2)
         citations.append("DB:documents")
-        return {"response": response, "citations": citations, "debug": debug}
+        return _wrap_response(response, citations, debug, success=True)
 
     if intent == "missing_fields":
         rows = find_missing_fields()
@@ -1517,7 +1552,7 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
         debug["anomalies"] = anomalies if 'anomalies' in locals() else None
         debug["latency_ms"] = round((time.time() - start_time) * 1000, 2)
         citations.append("DB:documents")
-        return {"response": response, "citations": citations, "debug": debug}
+        return _wrap_response(response, citations, debug, success=True)
 
     if intent == "weekly_summary":
         start_time = time.time()
@@ -1553,7 +1588,7 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
         debug["models_used"] = ["Phi (router)"]
         debug["latency_ms"] = round((time.time() - start_time) * 1000, 2)
         citations.append("DB:documents")
-        return {"response": response, "citations": citations, "debug": debug}
+        return _wrap_response(response, citations, debug, success=True)
 
     if intent == "monthly_summary":
         start_time = time.time()
@@ -1589,7 +1624,7 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
         debug["models_used"] = ["Phi (router)"]
         debug["latency_ms"] = round((time.time() - start_time) * 1000, 2)
         citations.append("DB:documents")
-        return {"response": response, "citations": citations, "debug": debug}
+        return _wrap_response(response, citations, debug, success=True)
 
     if intent == "pending_receipts":
         start_time = time.time()
@@ -1627,7 +1662,7 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
         debug["models_used"] = ["Phi (router)"]
         debug["latency_ms"] = round((time.time() - start_time) * 1000, 2)
         citations.append("DB:documents")
-        return {"response": response, "citations": citations, "debug": debug}
+        return _wrap_response(response, citations, debug, success=True)
 
     if intent == "vendor_verification" or "verify" in user_text.lower():
         # Better vendor extraction: keep everything after "verify vendor" / "verify"
@@ -1647,7 +1682,7 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
 
         if not vendor_name or len(vendor_name) < 2:
             response = "Please specify which vendor to verify (e.g., 'Verify vendor Domino\\'s')"
-            return {"response": response, "citations": citations, "debug": debug}
+            return _wrap_response(response, citations, debug, success=True)
 
         result = verify_vendor_online(vendor_name)
         debug["vendor_result"] = result
@@ -1658,7 +1693,7 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
         if result.get("error"):
             response += f"**Status:** ✗ Not Verified\n**Error:** {result['error']}\n"
             citations.append("WEB:duckduckgo_html")
-            return {"response": response, "citations": citations, "debug": debug}
+            return _wrap_response(response, citations, debug, success=True)
 
         best = result.get("best_guess_official")
         confidence = result.get("confidence", 0.0)
@@ -1682,4 +1717,16 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
             if r.get("url"):
                 citations.append(r["url"])
 
-        return {"response": response, "citations": citations, "debug": debug}
+        return _wrap_response(response, citations, debug, success=True)
+    
+    # Final fallback: never return None
+    response = (
+        "I can:\n"
+        "- Extract receipts/invoices (OCR) and store them in SQLite\n"
+        "- Show recent receipts, spend by vendor/category, duplicates, anomalies\n"
+        "- Weekly/monthly summaries and pending receipts editing\n"
+        "- Vendor verification and currency conversion\n"
+        "- Security protections against prompt injection\n"
+    )
+    citations = citations if isinstance(citations, list) else []
+    return _wrap_response(response, citations, debug, success=True)
