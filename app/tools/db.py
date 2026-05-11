@@ -2,9 +2,13 @@
 
 from pathlib import Path
 import sqlite3
+import re
+from datetime import datetime
 
 
 DB_PATH = Path(__file__).resolve().parents[2] / "receiptiq.sqlite"
+ALLOWED_CURRENCIES = {"USD", "EUR", "GBP", "INR", "CAD", "AUD", "JPY"}
+MAX_TOTAL = 10000.0
 
 
 def _connect() -> sqlite3.Connection:
@@ -996,41 +1000,130 @@ def get_document(doc_id: int) -> dict:
     """
     return get_document_by_id(doc_id)
 
+def _normalize_date(d: str | None) -> str | None:
+    if not d:
+        return None
+    d = str(d).strip()
+    # ISO already
+    try:
+        return datetime.strptime(d, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    # common formats
+    for fmt in ("%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y", "%d-%m-%Y", "%d-%m-%y"):
+        try:
+            return datetime.strptime(d, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+    raise ValueError(f"Invalid date format: {d}")
+
+def _validate_amount(x, field="amount", max_value=MAX_TOTAL):
+    if x is None or x == "":
+        return None
+    try:
+        v = float(x)
+    except Exception:
+        raise ValueError(f"{field} must be numeric")
+    if v < 0:
+        raise ValueError(f"{field} cannot be negative")
+    if v > max_value:
+        raise ValueError(f"{field} too large (>{max_value})")
+    return v
+
+def log_edit(doc_id: int, field: str, old_value: str | None, new_value: str | None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS document_edits (
+                edit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                doc_id INTEGER NOT NULL,
+                field TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT,
+                edited_at TEXT DEFAULT (datetime('now'))
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO document_edits (doc_id, field, old_value, new_value)
+            VALUES (?, ?, ?, ?)
+            """,
+            (doc_id, field, str(old_value) if old_value is not None else None, str(new_value) if new_value is not None else None),
+        )
+        conn.commit()
+        
+def _validate_currency(cur: str | None) -> str | None:
+    if not cur:
+        return None
+    cur = str(cur).upper().strip()
+    if cur not in ALLOWED_CURRENCIES:
+        raise ValueError(f"Unsupported currency: {cur}")
+    return cur
+
+def _totals_mismatch(subtotal, tax, total, tol=0.05) -> str | None:
+    if subtotal is None or tax is None or total is None:
+        return None
+    if abs((subtotal + tax) - total) > tol:
+        return f"subtotal({subtotal}) + tax({tax}) != total({total})"
+    return None
 
 def update_document(doc_id: int, updates: dict) -> None:
-    """Update document fields.
-    
-    Allowed fields: vendor, doc_date, total, tax, subtotal, currency, category,
-                    invoice_number, description, is_pending
-    Sets updated_at to current timestamp.
-    
-    If vendor and category are both provided, learns the association in vendor_profiles.
+    """
+    Update document fields with guardrails:
+    - Validate & normalize inputs (date, currency, numeric totals)
+    - Log changes in document_edits
+    - Add audit flag if subtotal+tax != total
     """
     allowed_fields = {
         "vendor", "doc_date", "total", "tax", "subtotal", "currency",
         "category", "invoice_number", "description", "is_pending"
     }
-    
-    # Filter updates to only allowed fields
+
     filtered_updates = {k: v for k, v in updates.items() if k in allowed_fields}
-    
     if not filtered_updates:
         return
-    
+
+    # Load existing doc for audit trail + consistency checks
+    existing = get_document_by_id(int(doc_id)) or {}
+
+    # Normalize/validate
+    if "vendor" in filtered_updates and filtered_updates["vendor"] is not None:
+        filtered_updates["vendor"] = str(filtered_updates["vendor"]).strip() or None
+
+    if "doc_date" in filtered_updates:
+        filtered_updates["doc_date"] = _normalize_date(filtered_updates.get("doc_date"))
+
+    for k in ("total", "tax", "subtotal"):
+        if k in filtered_updates:
+            filtered_updates[k] = _validate_amount(filtered_updates.get(k), field=k)
+
+    if "currency" in filtered_updates:
+        filtered_updates["currency"] = _validate_currency(filtered_updates.get("currency"))
+
+    if "category" in filtered_updates and filtered_updates["category"] is not None:
+        filtered_updates["category"] = str(filtered_updates["category"]).strip() or None
+
     # Learn vendor→category association if both are present
     vendor = filtered_updates.get("vendor")
     category = filtered_updates.get("category")
     if vendor and category:
         set_vendor_category(vendor, category)
-    
+
+    # If key fields are now present, auto-clear pending (unless caller explicitly set it)
+    if "is_pending" not in filtered_updates:
+        has_vendor = (filtered_updates.get("vendor") or existing.get("vendor")) not in (None, "")
+        has_date = (filtered_updates.get("doc_date") or existing.get("doc_date")) not in (None, "")
+        has_total = (filtered_updates.get("total") if "total" in filtered_updates else existing.get("total")) not in (None, "", 0)
+        if has_vendor and has_date and has_total:
+            filtered_updates["is_pending"] = 0
+
     # Build SET clause dynamically
     set_clauses = [f"{field} = ?" for field in filtered_updates.keys()]
     set_clauses.append("updated_at = datetime('now')")
     set_clause = ", ".join(set_clauses)
-    
-    # Build values tuple (add doc_id at the end for WHERE clause)
     values = tuple(filtered_updates.values()) + (doc_id,)
-    
+
     with _connect() as conn:
         conn.execute(
             f"""
@@ -1041,6 +1134,21 @@ def update_document(doc_id: int, updates: dict) -> None:
             values,
         )
         conn.commit()
+
+    # Audit log: record old -> new for each changed field
+    for field, new_val in filtered_updates.items():
+        old_val = existing.get(field)
+        if str(old_val) != str(new_val):
+            log_edit(int(doc_id), field, old_val, new_val)
+
+    # Totals consistency check (soft guardrail → audit flag)
+    subtotal = filtered_updates.get("subtotal", existing.get("subtotal"))
+    tax = filtered_updates.get("tax", existing.get("tax"))
+    total = filtered_updates.get("total", existing.get("total"))
+
+    mismatch = _totals_mismatch(subtotal, tax, total)
+    if mismatch:
+        add_flag(int(doc_id), "totals_validation", mismatch)
 
 
 def get_vendor_category(vendor: str) -> str | None:
@@ -1161,3 +1269,112 @@ def add_category(category: str, display_name: str | None = None) -> None:
             )
         
         conn.commit()
+        
+        
+def get_edit_history(doc_id: int, limit: int = 50) -> list[dict]:
+    """
+    Return edit history for a document (most recent first).
+    Requires document_edits table (created by log_edit()).
+    """
+    with _connect() as conn:
+        # If table doesn't exist yet, return empty history
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS document_edits (
+                edit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                doc_id INTEGER NOT NULL,
+                field TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT,
+                edited_at TEXT DEFAULT (datetime('now'))
+            )
+            """
+        )
+
+        rows = conn.execute(
+            """
+            SELECT field, old_value, new_value, edited_at
+            FROM document_edits
+            WHERE doc_id = ?
+            ORDER BY edit_id DESC
+            LIMIT ?
+            """,
+            (doc_id, limit),
+        ).fetchall()
+
+    return [
+        {"field": r[0], "old": r[1], "new": r[2], "edited_at": r[3]}
+        for r in rows
+    ]
+
+
+def integrity_check(doc_id: int) -> dict:
+    """
+    Check document integrity and return status summary.
+    
+    Returns dict with:
+    - missing_fields: list of field names that are required but NULL/empty
+    - totals_mismatch: bool, whether subtotal+tax ≈ total
+    - mismatch_message: str, error message if mismatch
+    - last_edit_time: str, timestamp of most recent edit (or NULL if no edits)
+    - edit_count: int, number of edits recorded
+    - is_pending: bool, whether document is marked pending
+    - status: str, human-readable status ("verified", "pending", "mismatch_flag")
+    """
+    doc = get_document_by_id(doc_id)
+    if not doc:
+        return {"error": f"Document {doc_id} not found"}
+    
+    # Check for missing fields
+    missing_fields = []
+    if not doc.get("vendor"):
+        missing_fields.append("vendor")
+    if not doc.get("doc_date"):
+        missing_fields.append("date")
+    if doc.get("total") is None or doc.get("total") == 0:
+        missing_fields.append("total")
+    
+    # Check totals mismatch
+    subtotal = doc.get("subtotal")
+    tax = doc.get("tax")
+    total = doc.get("total")
+    
+    mismatch_msg = _totals_mismatch(subtotal, tax, total)
+    totals_mismatch = mismatch_msg is not None
+    
+    # Get edit history
+    edits = get_edit_history(doc_id, limit=1)
+    last_edit_time = edits[0].get("edited_at") if edits else None
+    
+    # Count total edits
+    with _connect() as conn:
+        cursor = conn.execute(
+            "SELECT COUNT(*) FROM document_edits WHERE doc_id = ?",
+            (doc_id,)
+        )
+        edit_count = cursor.fetchone()[0] if cursor.fetchone() else 0
+    
+    # Determine status
+    is_pending = doc.get("is_pending") == 1
+    has_mismatch_flag = False
+    
+    # Check for totals_validation audit flag
+    flags = get_audit_flags(doc_id)
+    has_mismatch_flag = any(f["flag_type"] == "totals_validation" for f in flags)
+    
+    if has_mismatch_flag:
+        status = "mismatch_flag"
+    elif missing_fields:
+        status = "pending"
+    else:
+        status = "verified"
+    
+    return {
+        "missing_fields": missing_fields,
+        "totals_mismatch": totals_mismatch,
+        "mismatch_message": mismatch_msg,
+        "last_edit_time": last_edit_time,
+        "edit_count": edit_count,
+        "is_pending": is_pending,
+        "status": status,
+    }

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import traceback
 from typing import Optional
 
 import gradio as gr
@@ -13,7 +15,13 @@ from app.tools.db import (
     list_pending_receipts,
     update_document,
     get_document_by_id,
+    get_edit_history,
+    integrity_check
 )
+
+
+# Configure logger
+logger = logging.getLogger(__name__)
 
 
 def _format_assistant_response(payload: dict) -> str:
@@ -199,7 +207,26 @@ def _on_submit(
     return "", None, history
 
 
+def render_edit_history(doc_id):
+    """Render edit history for the selected receipt."""
+    if not doc_id:
+        return "No receipt selected."
+    try:
+        rows = get_edit_history(int(doc_id), limit=50)
+        if not rows:
+            return "No edits recorded yet."
+        md = "### Edit History (most recent first)\n\n"
+        md += "| Time | Field | Old | New |\n"
+        md += "|---|---|---|---|\n"
+        for r in rows:
+            md += f"| {r['edited_at']} | {r['field']} | {r['old']} | {r['new']} |\n"
+        return md
+    except Exception as e:
+        return f"Error loading history: {e}"
+
+
 def build_app() -> gr.Blocks:
+    """Build and return the Gradio application."""
     with gr.Blocks(title="ReceiptIQ") as demo:
         gr.Markdown("# ReceiptIQ - Expense Management")
         
@@ -331,9 +358,14 @@ def build_app() -> gr.Blocks:
                     
                     with gr.Row():
                         save_btn = gr.Button("💾 Save Changes", variant="primary", scale=2)
+                        view_history_btn = gr.Button("View Edit History")
+                        history_md = gr.Markdown()
                         clear_btn = gr.Button("🗑️ Clear", variant="secondary", scale=1)
                     
                     status_msg = gr.Textbox(label="Status", interactive=False, visible=True)
+                
+                # State to track if confirmation is needed for high-risk edit
+                confirm_state = gr.State({"needs_confirm": False, "pending_updates": None})
                 
                 # Handler: When radio selection changes, show form and load data
                 def on_radio_select(selected_label):
@@ -370,16 +402,25 @@ def build_app() -> gr.Blocks:
                     except Exception as e:
                         return 0, "other", "", "", 0, f"Error: {str(e)}", gr.update(visible=False)
                 
-                # Handler: Save changes (always attach)
-                def save_pending_changes(doc_id, vendor, category, date, total):
-                    """Save edited pending receipt back to database."""
+                # Handler: Save changes with high-risk edit warning
+                def save_pending_changes(doc_id, vendor, category, date, total, confirm_data):
+                    """Save edited pending receipt with high-risk edit warning.
+                    
+                    Checks if total changed by >30% and requires confirmation before saving.
+                    After save, shows integrity check status.
+                    """
                     if not doc_id or doc_id == 0:
-                        return "Please load a receipt first", gr.update(choices=_get_pending_receipts_choices(), value=None)
+                        return (
+                            "Please load a receipt first",
+                            gr.update(choices=_get_pending_receipts_choices(), value=None),
+                            {"needs_confirm": False, "pending_updates": None}
+                        )
                     
                     try:
                         doc_id_int = int(doc_id)
-                        updates = {}
                         
+                        # Build updates dict
+                        updates = {}
                         if vendor and vendor.strip():
                             updates["vendor"] = vendor.strip()
                         if category and category.strip():
@@ -390,29 +431,111 @@ def build_app() -> gr.Blocks:
                             updates["total"] = float(total)
                         
                         if not updates:
-                            return "No changes to save", gr.update(choices=_get_pending_receipts_choices(), value=None)
+                            return (
+                                "No changes to save",
+                                gr.update(choices=_get_pending_receipts_choices(), value=None),
+                                {"needs_confirm": False, "pending_updates": None}
+                            )
                         
-                        # If vendor, date, and total are all provided, mark as no longer pending
+                        # Check if this is a high-risk edit (total changed by >30%)
+                        if "total" in updates:
+                            doc = get_document_by_id(doc_id_int)
+                            old_total = doc.get("total") if doc else None
+                            new_total = updates["total"]
+                            
+                            if old_total and old_total != 0:
+                                pct_change = abs((new_total - old_total) / old_total) * 100
+                                
+                                # High-risk threshold: >30% change
+                                if pct_change > 30:
+                                    # Check if this is first click (needs confirmation)
+                                    if not confirm_data.get("needs_confirm"):
+                                        # First click: show warning and set flag
+                                        warning_msg = (
+                                            f"⚠️ HIGH-RISK EDIT:\n"
+                                            f"Total changing by {pct_change:.1f}%\n"
+                                            f"Old: ${old_total:.2f} → New: ${new_total:.2f}\n"
+                                            f"\n**Click Save again to confirm.**"
+                                        )
+                                        return (
+                                            warning_msg,
+                                            gr.update(choices=_get_pending_receipts_choices(), value=None),
+                                            {"needs_confirm": True, "pending_updates": updates}
+                                        )
+                                    else:
+                                        # Second click: proceed with update using stored updates
+                                        updates = confirm_data.get("pending_updates", updates)
+                        
+                        # Apply auto-clear pending status
                         has_vendor = updates.get("vendor") or (vendor and vendor.strip())
                         has_date = updates.get("doc_date") or (date and date.strip())
                         has_total = updates.get("total") or (total and total > 0)
                         
                         if has_vendor and has_date and has_total:
-                            updates["is_pending"] = False
+                            updates["is_pending"] = 0
                         
+                        # Save to database
                         update_document(doc_id_int, updates)
-                        # Return updated choices to refresh the radio button
-                        return f"✓ Saved doc #{doc_id_int}", gr.update(choices=_get_pending_receipts_choices(), value=None)
+                        
+                        # Get integrity check result
+                        check_result = integrity_check(doc_id_int)
+                        status_text = f"✓ Saved doc #{doc_id_int}\n"
+                        
+                        if check_result.get("status") == "verified":
+                            status_text += "📋 Status: **Verified** ✅"
+                        elif check_result.get("status") == "pending":
+                            missing = ", ".join(check_result.get("missing_fields", []))
+                            status_text += f"📋 Status: **Pending** ⏳ (missing: {missing})"
+                        else:
+                            status_text += "📋 Status: **Has Mismatch Flag** ⚠️"
+                        
+                        if check_result.get("edit_count"):
+                            status_text += f"\n📝 Edits: {check_result['edit_count']}"
+                        
+                        return (
+                            status_text,
+                            gr.update(choices=_get_pending_receipts_choices(), value=None),
+                            {"needs_confirm": False, "pending_updates": None}
+                        )
+                    
+                    except ValueError as e:
+                        # Validation error from guardrails - display exact message cleanly
+                        error_msg = f"⚠ Validation error: {str(e)}"
+                        logger.debug(f"Validation error for doc #{doc_id}: {str(e)}")
+                        return (
+                            error_msg,
+                            gr.update(choices=_get_pending_receipts_choices(), value=None),
+                            {"needs_confirm": False, "pending_updates": None}
+                        )
+                    
                     except Exception as e:
-                        return f"Error saving: {str(e)}", gr.update(choices=_get_pending_receipts_choices(), value=None)
+                        # Unexpected error - show short message, log full details
+                        error_msg = f"❌ Error saving document. Check console for details."
+                        logger.error(
+                            f"Unexpected error saving doc #{doc_id}:\n{traceback.format_exc()}",
+                            exc_info=True
+                        )
+                        return (
+                            error_msg,
+                            gr.update(choices=_get_pending_receipts_choices(), value=None),
+                            {"needs_confirm": False, "pending_updates": None}
+                        )
+
+
                 
                 save_btn.click(
                     save_pending_changes,
-                    [selected_doc_id, edit_vendor, edit_category, edit_date, edit_total],
-                    [status_msg, pending_radio],
+                    [selected_doc_id, edit_vendor, edit_category, edit_date, edit_total, confirm_state],
+                    [status_msg, pending_radio, confirm_state],
                 )
                 
-                # Handler: Clear form
+                
+                view_history_btn.click(
+                    fn=render_edit_history,
+                    inputs=[doc_id_box],
+                    outputs=[history_md],
+                )
+# Handler: Clear form
                 def clear_form():
                     return 0, "other", "", "", 0, "Cleared"
                 

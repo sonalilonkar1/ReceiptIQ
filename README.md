@@ -188,6 +188,114 @@ Example attack (auto-detected):
 
 ---
 
+## Professor Guardrails Verification
+
+**Comprehensive validation of edit guardrails and data integrity protection.** All 23 tests verify that the system safely handles user edits while protecting data from untrusted modifications.
+
+### Run All Tests (Recommended)
+```bash
+python scripts/run_guardrail_checks.py
+```
+
+Expected output:
+```
+🎉 ALL GUARDRAIL CHECKS PASSED!
+
+✅ Your system is verified to have:
+    ✓ Input validation guardrails (type, range, format)
+    ✓ High-risk edit warnings with confirmation
+    ✓ Totals mismatch detection and flagging
+    ✓ Complete edit audit trails
+    ✓ Pending receipt auto-clear logic
+    ✓ Vendor profile learning
+    ✓ Integrity checking and status reporting
+    ✓ Clean error handling (no stack traces to users)
+
+→ The system is READY FOR PRODUCTION
+```
+
+### Individual Test Suites
+
+**Edit Guardrails (9 tests):**
+```bash
+python scripts/test_edit_guardrails.py
+```
+Validates:
+- ✓ Type checking (amounts must be numeric)
+- ✓ Range validation (totals ≤ $10,000)
+- ✓ Format validation (dates, currencies)
+- ✓ Totals mismatch detection (subtotal + tax ≈ total)
+- ✓ Pending receipt auto-clear (when vendor + date + total provided)
+- ✓ Vendor profile learning (vendor → category mapping)
+- ✓ Audit trail creation (all edits recorded with old→new values)
+- ✓ Date normalization (accepts MM/DD/YYYY, ISO, European formats)
+
+**UI Edit History (9 tests):**
+```bash
+python scripts/test_ui_edit_history.py
+```
+Validates:
+- ✓ Edit history display (markdown table rendering)
+- ✓ Most-recent-first ordering
+- ✓ Timestamp recording (all edits timestamped)
+- ✓ Edit integrity (old and new values recorded correctly)
+- ✓ Integrity checking (missing fields detection)
+- ✓ Document status (verified, pending, mismatch detection)
+
+### What Gets Tested
+
+| Guardrail | Test Case | Expected Behavior |
+|-----------|-----------|-------------------|
+| **Type Validation** | Save amount as string | ✅ Rejected: "total must be numeric" |
+| **Range Validation** | Save negative amount | ✅ Rejected: "total cannot be negative" |
+| **Currency Check** | Use unsupported currency | ✅ Rejected: "Unsupported currency: XYZ" |
+| **Date Format** | Invalid date (13/40/2026) | ✅ Rejected: "Invalid date format" |
+| **Totals Mismatch** | subtotal=$10, tax=$2, total=$50 | ✅ Flagged: "Audit flag created" |
+| **Pending Auto-Clear** | Provide vendor + date + total | ✅ Auto-cleared: is_pending → 0 |
+| **Vendor Learning** | Set vendor=Acme, category=supplies | ✅ Learned: Future Acme → supplies |
+| **Audit Trail** | Edit vendor, amount, date | ✅ All 3 edits recorded with timestamps |
+| **High-Risk Edit** | Change total by >30% | ✅ Warning shown, requires 2nd click to confirm |
+
+### High-Risk Edit Protection
+
+When editing a pending receipt, if the total changes by more than **30%**:
+
+1. **First click**: Warning displayed
+   ```
+   ⚠️ HIGH-RISK EDIT:
+   Total changing by 45.2%
+   Old: $100.00 → New: $145.20
+   
+   Click Save again to confirm.
+   ```
+
+2. **Second click**: Update proceeds with full integrity check
+
+This prevents accidental large changes while maintaining usability.
+
+### Integrity Check Status
+
+After saving, the system displays status:
+
+| Status | Indicator | Meaning |
+|--------|-----------|---------|
+| **Verified** | ✅ | All required fields present, totals match |
+| **Pending** | ⏳ | Missing vendor, date, or total (can be completed) |
+| **Mismatch** | ⚠️ | Totals inconsistent (subtotal + tax ≠ total) |
+
+### Audit Logging
+
+Every edit is logged with:
+- Timestamp (ISO 8601 format)
+- Field name (vendor, category, date, total, etc.)
+- Old value (before change)
+- New value (after change)
+- User (future enhancement)
+
+View edit history in UI: **Pending Receipts Tab** → **View Edit History** button
+
+---
+
 ## Configuration
 
 ### Model Mode
