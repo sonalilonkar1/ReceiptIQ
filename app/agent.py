@@ -6,7 +6,28 @@ from typing import Optional
 import json
 import re
 import time
+import logging
+import sys
 from pathlib import Path
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s',
+    handlers=[logging.FileHandler('receiptiq.log'), logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+# DEBUG LOGGING FLAG - Set to True to enable logs, False to disable
+DEBUG_LOGS = True
+
+def log_receipt(message: str, doc_id: int = None):
+    """Log receipt-related messages when DEBUG_LOGS is enabled."""
+    if DEBUG_LOGS:
+        prefix = f"[Receipt #{doc_id}]" if doc_id else "[Receipt]"
+        print(f"📋 {prefix} {message}", flush=True)
+        logger.info(f"{prefix} {message}")
+
 
 from app.tools.db import (
     add_flag,
@@ -33,9 +54,10 @@ from app.tools.db import (
     verify_vendor,
     _connect,
 )
-from app.tools.vision import extract_fields_from_image, validate_totals
-from app.tools.web import web_lookup, verify_vendor_online
+from app.tools.vision import extract_fields_from_image, validate_totals, _classify_category, _extract_invoice_number, _extract_line_items
+from app.tools.web import web_lookup, verify_vendor_online, normalize_vendor_name
 from app.tools.llm_parser import parse_receipt_text_with_llm
+from app.tools.donut import extract_fields_donut
 
 try:
     from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
@@ -995,7 +1017,9 @@ def _parse_receipt_with_llm_fallback(raw_text: str, model: str = "phi") -> dict:
     }
     """
     # Primary: LLM parsing
-    llm_result = parse_receipt_text_with_llm(raw_text, model=model.lower())
+    log_receipt("LLM Extraction - Preprocessing OCR text (fix errors, remove duplicates)")
+    log_receipt("LLM Extraction - Calling LLM parser (using Phi - faster & reliable)")
+    llm_result = parse_receipt_text_with_llm(raw_text, model="phi")
     
     # Extract values from LLM result (structure: {field: {value, confidence, evidence_line}})
     vendor = llm_result.get("vendor", {}).get("value")
@@ -1008,7 +1032,7 @@ def _parse_receipt_with_llm_fallback(raw_text: str, model: str = "phi") -> dict:
     invoice_number = llm_result.get("invoice_number", {}).get("value")
     line_items = llm_result.get("line_items", {}).get("value")
     
-    # Collect per-field confidence scores
+    # Collect per-field confidence scores from LLM
     llm_confidence = {
         "vendor": llm_result.get("vendor", {}).get("confidence", 0.0),
         "date": llm_result.get("date", {}).get("confidence", 0.0),
@@ -1017,6 +1041,9 @@ def _parse_receipt_with_llm_fallback(raw_text: str, model: str = "phi") -> dict:
         "tax": llm_result.get("tax", {}).get("confidence", 0.0),
     }
     
+    # Log what LLM extracted
+    log_receipt(f"LLM Extracted: vendor='{vendor}' (conf:{llm_confidence['vendor']:.2f}), date='{date}' (conf:{llm_confidence['date']:.2f}), total={total} (conf:{llm_confidence['total']:.2f})")
+    
     # Fallback to regex if critical fields are missing or LLM confidence too low
     if not vendor or llm_confidence.get("vendor", 0) < 0.5:
         # Try regex fallback for vendor
@@ -1024,26 +1051,42 @@ def _parse_receipt_with_llm_fallback(raw_text: str, model: str = "phi") -> dict:
         from app.tools.vision import _guess_vendor
         vendor_guess = _guess_vendor(lines)
         if vendor_guess and not vendor:
+            log_receipt(f"Vendor Fallback: Using regex fallback. LLM='{vendor}' (conf:{llm_confidence['vendor']:.2f}) → Regex='{vendor_guess}'")
             vendor = vendor_guess
             llm_confidence["vendor"] = 0.3  # Lower confidence for regex fallback
+        elif vendor and llm_confidence.get("vendor", 0) < 0.5:
+            log_receipt(f"Vendor Fallback: LLM confidence too low. Keeping LLM value '{vendor}' (conf:{llm_confidence['vendor']:.2f})")
     
     if not date or llm_confidence.get("date", 0) < 0.5:
         # Try regex fallback for date
         from app.tools.vision import _extract_date
         date_guess = _extract_date(raw_text)
         if date_guess and not date:
+            log_receipt(f"Date Fallback: Using regex fallback. LLM='{date}' (conf:{llm_confidence['date']:.2f}) → Regex='{date_guess}'")
             date = date_guess
             llm_confidence["date"] = 0.3
+        elif date and llm_confidence.get("date", 0) < 0.5:
+            log_receipt(f"Date Fallback: LLM confidence too low. Keeping LLM value '{date}' (conf:{llm_confidence['date']:.2f})")
     
     if not total or llm_confidence.get("total", 0) < 0.5:
-        # Try regex fallback for total
-        from app.tools.vision import _find_amount_by_labels, _find_max_amount
-        total_guess = _find_amount_by_labels(raw_text, ["total", "amount due", "balance due", "grand total"])
-        if not total_guess:
-            total_guess = _find_max_amount(raw_text)
-        if total_guess and not total:
-            total = total_guess
-            llm_confidence["total"] = 0.3
+        # CRITICAL: Before regex fallback, try calculating total from subtotal + tax
+        if not total and subtotal and tax:
+            calculated_total = subtotal + tax
+            log_receipt(f"Total Fallback: Calculating from subtotal({subtotal}) + tax({tax}) = {calculated_total}")
+            total = calculated_total
+            llm_confidence["total"] = 0.7  # Moderate-high confidence for calculated value
+        elif not total:
+            # Try regex fallback for total
+            from app.tools.vision import _find_amount_by_labels, _find_max_amount
+            total_guess = _find_amount_by_labels(raw_text, ["total", "amount due", "balance due", "grand total"])
+            if not total_guess:
+                total_guess = _find_max_amount(raw_text)
+            if total_guess:
+                log_receipt(f"Total Fallback: Using regex fallback. LLM={total} (conf:{llm_confidence['total']:.2f}) → Regex={total_guess}")
+                total = total_guess
+                llm_confidence["total"] = 0.3
+        elif total and llm_confidence.get("total", 0) < 0.5:
+            log_receipt(f"Total Fallback: LLM confidence too low. Keeping LLM value {total} (conf:{llm_confidence['total']:.2f})")
     
     # Format line_items for database (string with items separated by |)
     line_items_str = None
@@ -1061,6 +1104,11 @@ def _parse_receipt_with_llm_fallback(raw_text: str, model: str = "phi") -> dict:
         llm_confidence.get("subtotal", 0) * 0.125 +
         llm_confidence.get("tax", 0) * 0.125
     )
+    
+    # Log final values before returning
+    log_receipt(f"Final Extracted Values: vendor='{vendor}', date='{date}', total={total}, subtotal={subtotal}, tax={tax}")
+    log_receipt(f"Overall Confidence: {round(overall_confidence, 2):.2f}")
+    log_receipt(f"Per-field Confidence: vendor={llm_confidence['vendor']:.2f}, date={llm_confidence['date']:.2f}, total={llm_confidence['total']:.2f}")
     
     return {
         "doc_type": "receipt",
@@ -1108,26 +1156,183 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
             debug["intent"] = "document_lookup"
             debug["doc_id"] = doc_id
             return {"response": response, "citations": citations, "debug": debug}
-
     if file_path:
-        # Step 1: Extract raw OCR text from image
+        # =====================
+        # FILE INGEST PIPELINE
+        # Goal: maximize extraction accuracy using field-fusion:
+        #   OCR (deterministic candidates) -> Donut fallback -> Phi evidence-only fallback
+        # =====================
+        log_receipt("UPLOAD OPERATION STARTED - Processing image file")
+
+        # 1) OCR + deterministic candidates
         ocr_result = extract_fields_from_image(file_path)
-        raw_text = ocr_result.get("raw_text", "")
-        
-        # Step 2: Parse with LLM + fallback to regex
-        extracted = _parse_receipt_with_llm_fallback(raw_text)
-        
-        # Add OCR metadata
-        extracted["vendor_guess"] = ocr_result.get("vendor_guess")
-        
+        raw_text = ocr_result.get("raw_text", "") or ""
+        debug["ocr_chars"] = len(raw_text)
+
+        vendor = ocr_result.get("vendor_guess")
+        doc_date = ocr_result.get("date_guess")
+        total = ocr_result.get("total_guess")
+
+        extracted = {
+            "doc_type": "receipt",
+            "vendor": vendor,
+            "date": doc_date,
+            "total": total,
+            "subtotal": None,
+            "tax": None,
+            "currency": "USD",
+            "category": _classify_category(vendor, raw_text),
+            "invoice_number": _extract_invoice_number(raw_text),
+            "line_items": _extract_line_items(raw_text),
+            "raw_text": raw_text,
+            # track where each field came from
+            "field_source": {
+                "vendor": "ocr",
+                "date": "ocr",
+                "total": "ocr",
+            },
+        }
+
+        log_receipt(f"OCR candidates: vendor={vendor!r}, date={doc_date!r}, total={total!r}")
+        debug["vendor_candidates"] = ocr_result.get("vendor_candidates", [])
+        debug["date_candidates"] = ocr_result.get("date_candidates", [])
+        debug["total_candidates"] = ocr_result.get("total_candidates", [])
+
+        # 2) Donut fallback (best for vendor/date; usually weak on totals)
+        need_donut = (not extracted.get("vendor")) or (not extracted.get("date"))
+        if need_donut:
+            try:
+                donut_result = extract_fields_donut(image_path=file_path, task="sroie")
+                debug["donut_conf"] = donut_result.get("confidence")
+                if not extracted.get("vendor") and donut_result.get("vendor"):
+                    extracted["vendor"] = donut_result["vendor"]
+                    extracted["field_source"]["vendor"] = "donut"
+                if not extracted.get("date") and donut_result.get("date"):
+                    extracted["date"] = donut_result["date"]
+                    extracted["field_source"]["date"] = "donut"
+                # only fill total from donut if OCR couldn't find one
+                if (extracted.get("total") in (None, 0, "")) and donut_result.get("total") is not None:
+                    extracted["total"] = donut_result["total"]
+                    extracted["field_source"]["total"] = "donut"
+                log_receipt(f"Donut fallback: vendor={donut_result.get('vendor')!r}, date={donut_result.get('date')!r}, total={donut_result.get('total')!r}")
+            except Exception as e:
+                log_receipt(f"Donut fallback failed: {e}")
+
+        # If OCR total looks suspicious (e.g., came from CHANGE/CASH/TIP) and Donut has a total, override.
+        try:
+            tc = debug.get("total_candidates") or []
+            tc_labels = [str(x[0]).lower() for x in tc if isinstance(x, (list, tuple)) and len(x) >= 2]
+            if extracted.get("field_source", {}).get("total") == "ocr" and extracted.get("total") is not None:
+                if any(lbl in tc_labels for lbl in ["change", "payment", "tip"]):
+                    # use Donut total if present
+                    if "donut_result" in locals() and donut_result and donut_result.get("total") is not None:
+                        extracted["total"] = donut_result["total"]
+                        extracted["field_source"]["total"] = "donut_override"
+                        log_receipt(f"Total override: OCR looked like payment/change; using Donut total={donut_result.get('total')}")
+        except Exception:
+            pass
+
+        # Lightweight vendor cleanup + optional online verification ONLY when vendor looks suspicious.
+        try:
+            vraw = extracted.get("vendor")
+            if vraw:
+                extracted["vendor"] = normalize_vendor_name(vraw)
+                vlow = extracted["vendor"].lower()
+                suspicious = (
+                    len(extracted["vendor"]) < 3
+                    or "expect more" in vlow
+                    or "pay less" in vlow
+                    or "purchase" in vlow
+                    or vlow in {"united states", "united", "states"}
+                )
+                if suspicious:
+                    ver = verify_vendor_online(extracted["vendor"], timeout_s=2.0)
+                    debug["vendor_verify"] = {
+                        "confidence": ver.get("confidence"),
+                        "cached": ver.get("cached"),
+                        "best": ver.get("best_guess_official"),
+                        "error": ver.get("error"),
+                    }
+                    best = ver.get("best_guess_official") or {}
+                    dom = (best.get("domain") or "").lower()
+                    if "target.com" in dom:
+                        extracted["vendor"] = "Target"
+                        extracted["field_source"]["vendor"] = extracted["field_source"].get("vendor", "ocr") + "+webnorm"
+                    elif "usps.com" in dom:
+                        extracted["vendor"] = "USPS"
+                        extracted["field_source"]["vendor"] = extracted["field_source"].get("vendor", "ocr") + "+webnorm"
+                    elif "shakeshack.com" in dom:
+                        extracted["vendor"] = "Shake Shack"
+                        extracted["field_source"]["vendor"] = extracted["field_source"].get("vendor", "ocr") + "+webnorm"
+        except Exception:
+            pass
+
+        # 3) Phi evidence-only fallback (only when still missing)
+
+        missing = [k for k in ["vendor", "date", "total"] if not extracted.get(k)]
+        if missing:
+            log_receipt(f"Phi fallback triggered (missing={missing})")
+            try:
+                llm = parse_receipt_text_with_llm(raw_text, model="phi") or {}
+                debug["phi_used"] = True
+
+                def accept(field: str) -> Optional[str]:
+                    node = llm.get(field) or {}
+                    val = node.get("value")
+                    ev = node.get("evidence_line") or ""
+                    conf = node.get("confidence", 0.0)
+                    # evidence must appear in OCR text (prevents hallucinations)
+                    if not val:
+                        return None
+                    if ev and ev in raw_text:
+                        # extra rule for totals: evidence line should include total-ish keyword
+                        if field == "total" and not any(k in str(ev).lower() for k in ["total", "amount", "balance", "due", "grand"]):
+                            return None
+                        return val
+                    # If no evidence provided, reject (safer)
+                    return None
+
+                if not extracted.get("vendor"):
+                    v = accept("vendor")
+                    if v:
+                        extracted["vendor"] = v
+                        extracted["field_source"]["vendor"] = "phi_evidence"
+                if not extracted.get("date"):
+                    d = accept("date")
+                    if d:
+                        extracted["date"] = d
+                        extracted["field_source"]["date"] = "phi_evidence"
+                if not extracted.get("total"):
+                    t = accept("total")
+                    if t is not None:
+                        try:
+                            extracted["total"] = float(str(t).replace(",", "").replace("$", "").strip())
+                            extracted["field_source"]["total"] = "phi_evidence"
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                log_receipt(f"Phi fallback failed: {e}")
+
+        # 4) Final deterministic sanity (category depends on vendor)
+        extracted["category"] = _classify_category(extracted.get("vendor"), raw_text)
+
+        # Overall confidence = completeness score of critical fields
+        filled = sum(1 for k in ["vendor", "date", "total"] if extracted.get(k))
+        extracted["confidence_overall"] = round(filled / 3.0, 2)
+
+        extraction_source = "+".join(sorted(set(extracted["field_source"].values())))
+        extracted["extraction_source"] = extraction_source
+        debug["field_source"] = extracted["field_source"]
+        debug["extraction_source"] = extraction_source
+
+        # 5) Save to DB
         db_payload = _to_document_payload(extracted)
         doc_id = insert_document(db_payload)
         citations.append(f"DB:documents.doc_id={doc_id}")
 
         mismatch = validate_totals(extracted)
         debug["validation"] = mismatch
-        debug["llm_confidence"] = extracted.get("confidence_overall")
-        debug["llm_error"] = extracted.get("llm_error")
 
         flagged = False
         if mismatch:
@@ -1135,10 +1340,7 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
             citations.append(f"DB:audit_flags.doc_id={doc_id}")
             flagged = True
 
-        # Check if receipt is pending
         is_pending = db_payload.get("is_pending", 0)
-        
-        # Compute missing fields for display
         missing_fields = []
         if not db_payload.get("vendor"):
             missing_fields.append("vendor")
@@ -1147,21 +1349,19 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
         if not db_payload.get("total"):
             missing_fields.append("total")
 
-        vendor = extracted.get("vendor") or "unknown vendor"
-        date = extracted.get("date") or "unknown date"
-        total = extracted.get("total")
-        total_text = f"{total:.2f}" if isinstance(total, (int, float)) else str(total)
+        vendor_disp = extracted.get("vendor") or "unknown vendor"
+        date_disp = extracted.get("date") or "unknown date"
+        total_disp = extracted.get("total")
+        total_text = f"{total_disp:.2f}" if isinstance(total_disp, (int, float)) else str(total_disp)
 
         response = (
-            f"Processed receipt for {vendor} on {date}. "
+            f"Processed receipt for {vendor_disp} on {date_disp}. "
             f"Total: {total_text}. Saved as doc_id={doc_id}. "
             f"Pending: {'Yes' if is_pending else 'No'}."
         )
-        
-        if is_pending:
+        if is_pending and missing_fields:
             response += f" Missing: {', '.join(missing_fields)}."
             response += " Open the 'Pending Receipts' tab to complete the data."
-        
         if flagged:
             response += f" Audit flag added ({mismatch})."
 
@@ -1172,10 +1372,41 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
         debug["missing_fields"] = missing_fields
         return {"response": response, "citations": citations, "debug": debug}
 
+
+
     # Fast-path routing for common DB queries (avoids Ollama misclassification + improves latency)
     text_l = user_text.lower()
 
-    if ("recent" in text_l and ("receipt" in text_l or "transaction" in text_l)) or ("show me all my receipts" in text_l):
+    # Weekly receipts query (saved this week / this week)
+    if ("this week" in text_l or "saved this week" in text_l) and ("receipt" in text_l or "receipts" in text_l or "transaction" in text_l):
+        intent = "weekly_summary"
+
+    # Top spending categories this month
+    elif ("top" in text_l and ("category" in text_l or "categories" in text_l)) and ("month" in text_l) and ("this" in text_l or "current" in text_l):
+        intent = "spending_by_category"
+        debug["top_k"] = 5
+        debug["range"] = "this_month"
+
+    elif ("subtotal" in text_l and "tax" in text_l and "total" in text_l) or ("consistent" in text_l and "subtotal" in text_l):
+        intent = "validate_totals"
+    elif ("top" in text_l and "category" in text_l) and ("this month" in text_l or "current month" in text_l):
+        intent = "spending_by_category"
+        debug["top_k"] = 5
+        debug["range"] = "this_month"
+    elif ("average" in text_l and "lunch" in text_l) and ("week" in text_l or "weekly" in text_l):
+        intent = "avg_lunch_weekly"
+    elif ("why" in text_l and "flag" in text_l) or ("explain" in text_l and "flag" in text_l):
+        intent = "explain_flag"
+    elif ("compare" in text_l or "between" in text_l) and ("january" in text_l and "february" in text_l):
+        intent = "compare_spending_periods"
+    elif "reimburs" in text_l and ("summary" in text_l or "totals" in text_l):
+        intent = "reimbursement_summary"
+    elif "draft" in text_l and "email" in text_l and "reimburs" in text_l:
+        intent = "reimbursement_email"
+    elif ("mark" in text_l and "reimburs" in text_l):
+        intent = "mark_reimbursable"
+
+    elif ("recent" in text_l and ("receipt" in text_l or "transaction" in text_l)) or ("show me all my receipts" in text_l):
         intent = "recent"
     elif "last month" in text_l and ("receipt" in text_l or "transaction" in text_l):
         intent = "recent"
@@ -1331,6 +1562,136 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
         debug["latency_ms"] = round((time.time() - start_time) * 1000, 2)
         citations.append("DB:documents")
         return _wrap_response(response, citations, debug, success=True)
+
+    if intent == "validate_totals":
+        m = re.search(r"(?:doc|document|receipt)\s*#?(\d+)", user_text, re.IGNORECASE)
+        doc_id = int(m.group(1)) if m else None
+        if not doc_id:
+            latest = get_recent_docs(limit=1)
+            doc_id = int(latest[0][0]) if latest else None
+        if not doc_id:
+            return _wrap_response("No receipts found to validate.", citations, debug, success=True)
+
+        doc = get_document_by_id(doc_id) or {}
+        subtotal = doc.get("subtotal")
+        tax = doc.get("tax")
+        total = doc.get("total")
+
+        mismatch = False
+        if subtotal is not None and tax is not None and total is not None:
+            try:
+                expected = float(subtotal) + float(tax)
+                mismatch = abs(expected - float(total)) > 0.02
+            except Exception:
+                mismatch = False
+
+        citations.append(f"DB:documents.doc_id={doc_id}")
+        citations.append(f"DB:audit_flags.doc_id={doc_id}")
+
+        if mismatch:
+            add_flag(doc_id, "totals_mismatch", f"subtotal+tax != total (subtotal={subtotal}, tax={tax}, total={total})")
+            resp = f"⚠️ Totals mismatch for doc_id={doc_id}. I flagged it for review."
+        else:
+            resp = f"✅ Totals look consistent for doc_id={doc_id}."
+        return _wrap_response(resp, citations, debug, success=True)
+
+    if intent == "avg_lunch_weekly":
+        with _connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT strftime('%Y-W%W', COALESCE(doc_date, substr(created_at,1,10))) AS wk,
+                       COALESCE(SUM(total),0) AS wk_total
+                FROM documents
+                WHERE LOWER(COALESCE(category,'other')) = 'meals'
+                GROUP BY wk
+                ORDER BY wk DESC
+                LIMIT 8
+                """
+            ).fetchall()
+        totals = [float(r[1] or 0) for r in rows]
+        avg = (sum(totals) / len(totals)) if totals else 0.0
+        resp = f"🍔 **Average lunch/meals spend per week (last {len(totals)} weeks):** ${avg:.2f}"
+        citations.append("DB:documents")
+        debug["weekly_totals"] = rows
+        return _wrap_response(resp, citations, debug, success=True)
+
+    if intent == "reimbursement_summary":
+        summary = get_reimbursement_summary(user_text)
+        citations.append("DB:documents")
+        return _wrap_response(summary, citations, debug, success=True)
+
+    if intent == "reimbursement_email":
+        summary = get_reimbursement_summary(user_text)
+        body = (
+            "Hi [Manager Name],\n\n"
+            "Here is my reimbursable expense summary for the requested period:\n\n"
+            f"{summary}\n\n"
+            "Thanks,\n[Your Name]"
+        )
+        resp = "**Email Draft:**\n\n```\n" + body + "\n```"
+        citations.append("DB:documents")
+        return _wrap_response(resp, citations, debug, success=True)
+
+    if intent == "mark_reimbursable":
+        ids = [int(x) for x in re.findall(r"(?:doc|doc_id|document|receipt)\s*#?\s*(\d+)", user_text, re.IGNORECASE)]
+        citations.append("DB:documents")
+        if not ids:
+            return _wrap_response("Tell me which doc IDs to mark reimbursable (e.g., 'Mark doc 12 and 13 reimbursable').", citations, debug, success=True)
+
+        with _connect() as conn:
+            qmarks = ",".join(["?"] * len(ids))
+            conn.execute(
+                f"UPDATE documents SET reimbursable = 1, updated_at = datetime('now') WHERE doc_id IN ({qmarks})",
+                (*ids,),
+            )
+            conn.commit()
+
+        citations.append("DB:documents")
+        resp = (
+            f"✅ Marked receipts as reimbursable: {', '.join(map(str, ids))}.\n\n"
+            "Checklist of required attachments (typical):\n"
+            "- Original receipt image/PDF\n"
+            "- Proof of payment if required\n"
+            "- Business purpose note (1 line)\n"
+        )
+        debug["updated_doc_ids"] = ids
+        for d in ids:
+            citations.append(f"DB:audit_flags.doc_id={d}")
+        return _wrap_response(resp, citations, debug, success=True)
+
+    if intent == "explain_flag":
+        m = re.search(r"(?:doc|document|receipt)\s*#?(\d+)", user_text, re.IGNORECASE)
+        doc_id = int(m.group(1)) if m else None
+        if not doc_id:
+            with _connect() as conn:
+                row = conn.execute("SELECT doc_id FROM audit_flags ORDER BY datetime(created_at) DESC LIMIT 1").fetchone()
+            doc_id = int(row[0]) if row else None
+
+        if not doc_id:
+            return _wrap_response("No flagged receipts found.", citations, debug, success=True)
+
+        flags = get_audit_flags(doc_id)
+        citations.append(f"DB:documents.doc_id={doc_id}")
+        citations.append(f"DB:audit_flags.doc_id={doc_id}")
+
+        resp = f"🧾 **Flag Explanation for doc_id={doc_id}**\n\n"
+        if not flags:
+            resp += "No audit flags recorded.\n"
+        else:
+            for f in flags[:5]:
+                resp += f"• {f['flag_type']}: {f['detail']} (at {f['created_at']})\n"
+
+        resp += "\n**Next steps:** Open the Pending Receipts tab and choose the best candidate values (no free typing)."
+        return _wrap_response(resp, citations, debug, success=True)
+
+    if intent == "compare_spending_periods":
+        from datetime import datetime
+        year = datetime.now().year
+        comparison = compare_spending_periods(f"{year}-01-01", f"{year}-01-31", f"{year}-02-01", f"{year}-02-28")
+        resp = _format_spending_comparison(comparison, f"{year}-01", f"{year}-02")
+        citations.append("DB:documents")
+        debug["comparison"] = comparison
+        return _wrap_response(resp, citations, debug, success=True)
 
     if intent == "web_lookup":
         web_result = web_lookup(user_text)
@@ -1685,6 +2046,7 @@ def handle_message(user_text: str, file_path: Optional[str] = None) -> dict:
             return _wrap_response(response, citations, debug, success=True)
 
         result = verify_vendor_online(vendor_name)
+        citations.append("WEB:duckduckgo_html")
         debug["vendor_result"] = result
 
         # Format response

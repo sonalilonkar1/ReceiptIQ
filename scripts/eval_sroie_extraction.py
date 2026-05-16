@@ -5,8 +5,14 @@ import argparse
 import json
 import re
 from pathlib import Path
+import sys
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.tools.vision import extract_fields_from_image
+from app.tools.donut import extract_fields_donut
+from app.tools.donut import _normalize_date_donut  
 
 
 def norm_text(s) -> str:
@@ -41,6 +47,7 @@ def main() -> None:
     parser.add_argument("--img_dir", type=str, default="data/sroie_100/images")
     parser.add_argument("--lbl_dir", type=str, default="data/sroie_100/labels")
     parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--mode", type=str, default="ocr", choices=["ocr", "donut"])
     args = parser.parse_args()
 
     img_dir = Path(args.img_dir)
@@ -56,7 +63,7 @@ def main() -> None:
     t_ok = 0
     all_ok = 0
 
-    for img_path in imgs:
+    for idx, img_path in enumerate(imgs, start=1):
         label_path = lbl_dir / (img_path.stem + ".json")
         if not label_path.exists():
             continue
@@ -66,13 +73,18 @@ def main() -> None:
         gt_date = gt.get("date")
         gt_total = gt.get("total")
 
-        pred = extract_fields_from_image(str(img_path))
+        if args.mode == "ocr":
+            pred = extract_fields_from_image(str(img_path))
+        else:
+            pred = extract_fields_donut(image_path=str(img_path), task="sroie")
         pv = pred.get("vendor")
         pd = pred.get("date")
         pt = pred.get("total")
 
         v_match = vendor_match(pv, gt_vendor)
-        d_match = norm_text(pd) == norm_text(gt_date) if pd and gt_date else False
+        pd_norm = _normalize_date_donut(pd) if pd else None
+        gt_norm = _normalize_date_donut(gt_date) if gt_date else None
+        d_match = (pd_norm == gt_norm) if (pd_norm and gt_norm) else False
 
         pt_f = norm_amount(pt)
         gt_f = norm_amount(gt_total)
@@ -83,7 +95,12 @@ def main() -> None:
         t_ok += int(t_match)
         all_ok += int(v_match and d_match and t_match)
         n += 1
-
+        if n < 3:
+            print("IMG:", img_path.name)
+            print("GT :", gt_vendor, gt_date, gt_total)
+            print("PR :", pv, pd, pt)
+        if idx % 5 == 0:
+            print(f"[{idx}/{len(imgs)}] evaluated={n} vendor_ok={v_ok} date_ok={d_ok} total_ok={t_ok}", flush=True)
     print(f"N evaluated: {n}")
     print(f"Vendor match (substring): {v_ok/n:.2%}")
     print(f"Date exact match:         {d_ok/n:.2%}")

@@ -223,7 +223,7 @@ def _parse_duckduckgo_results(html: str, max_results: int = 3) -> list[dict]:
         return []
 
 
-def verify_vendor_online(vendor_name: str) -> dict:
+def verify_vendor_online(vendor_name: str, timeout_s: float = 2.0) -> dict:
     """Verify vendor online using DuckDuckGo HTML search.
     
     Args:
@@ -272,7 +272,7 @@ def verify_vendor_online(vendor_name: str) -> dict:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
-        response = requests.get(search_url, headers=headers, timeout=5)
+        response = requests.get(search_url, headers=headers, timeout=timeout_s)
         response.raise_for_status()
         
         # Parse results
@@ -364,3 +364,13 @@ def clear_vendor_cache() -> int:
     count = len(_VENDOR_CACHE)
     _VENDOR_CACHE.clear()
     return count
+
+
+def normalize_vendor_name(vendor: str) -> str:
+    """Normalize vendor to a cleaner canonical form (basic cleanup)."""
+    if not vendor:
+        return ""
+    v = vendor.strip()
+    v = re.sub(r"\s+", " ", v)
+    v = re.sub(r"[^A-Za-z0-9&.'\- ]+", "", v).strip()
+    return v

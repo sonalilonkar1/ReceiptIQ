@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import sqlite3
+import json
 import re
 from datetime import datetime
 
@@ -1077,7 +1078,7 @@ def update_document(doc_id: int, updates: dict) -> None:
     """
     allowed_fields = {
         "vendor", "doc_date", "total", "tax", "subtotal", "currency",
-        "category", "invoice_number", "description", "is_pending"
+        "category", "invoice_number", "description", "is_pending", "reimbursable"
     }
 
     filtered_updates = {k: v for k, v in updates.items() if k in allowed_fields}
@@ -1271,6 +1272,91 @@ def add_category(category: str, display_name: str | None = None) -> None:
         conn.commit()
         
         
+
+
+def spend_by_category_date_range(start_date: str, end_date: str, limit: int = 5) -> list[tuple]:
+    """Spend totals grouped by category for doc_date within [start_date, end_date].
+    Returns: [(category, sum_total, count), ...] ordered by sum_total desc.
+    """
+    with _connect() as conn:
+        cursor = conn.execute(
+            """
+            SELECT category, COALESCE(SUM(total), 0) AS sum_total, COUNT(*) AS count
+            FROM documents
+            WHERE doc_date BETWEEN ? AND ?
+            GROUP BY category
+            ORDER BY sum_total DESC
+            LIMIT ?
+            """,
+            (start_date, end_date, limit),
+        )
+        return cursor.fetchall()
+
+
+def avg_category_per_week(category: str = "meals", n_weeks: int = 8) -> dict:
+    """Compute average weekly spend for a given category over last n_weeks (by doc_date/created_at)."""
+    category = (category or "meals").lower().strip()
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT strftime('%Y-W%W', COALESCE(doc_date, substr(created_at,1,10))) AS wk,
+                   COALESCE(SUM(total),0) AS wk_total
+            FROM documents
+            WHERE LOWER(COALESCE(category,'other')) = ?
+            GROUP BY wk
+            ORDER BY wk DESC
+            LIMIT ?
+            """,
+            (category, n_weeks),
+        ).fetchall()
+    weeks = [r[0] for r in rows]
+    totals = [float(r[1] or 0) for r in rows]
+    avg = (sum(totals) / len(totals)) if totals else 0.0
+    return {"category": category, "weeks": weeks, "weekly_totals": totals, "avg": round(avg, 2)}
+
+
+def set_reimbursable(doc_ids: list[int], reimbursable: int = 1) -> int:
+    """Mark documents as reimbursable (1/0). Returns number of rows updated."""
+    if not doc_ids:
+        return 0
+    reimbursable = 1 if reimbursable else 0
+    with _connect() as conn:
+        qmarks = ",".join(["?"] * len(doc_ids))
+        cur = conn.execute(
+            f"UPDATE documents SET reimbursable = ?, updated_at = datetime('now') WHERE doc_id IN ({qmarks})",
+            (reimbursable, *doc_ids),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def get_latest_flagged_doc_id() -> int | None:
+    """Return most recent doc_id that has an audit flag, else None."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT doc_id FROM audit_flags ORDER BY datetime(created_at) DESC, flag_id DESC LIMIT 1"
+        ).fetchone()
+    return int(row[0]) if row else None
+
+
+def get_doc_candidates(doc_id: int) -> dict:
+    """Return stored candidate options for a document (vendor/date/total), if present.
+
+    Candidates are stored inside the documents.raw_text column as JSON:
+      {"raw_text": "...", "candidates": {...}, "evidence": {...}}
+    Falls back to empty dict if not available.
+    """
+    doc = get_document_by_id(int(doc_id)) or {}
+    raw = doc.get("raw_text") or ""
+    try:
+        if isinstance(raw, str) and raw.lstrip().startswith("{"):
+            data = json.loads(raw)
+            cands = data.get("candidates") or {}
+            return cands if isinstance(cands, dict) else {}
+    except Exception:
+        pass
+    return {}
+
 def get_edit_history(doc_id: int, limit: int = 50) -> list[dict]:
     """
     Return edit history for a document (most recent first).
@@ -1352,7 +1438,8 @@ def integrity_check(doc_id: int) -> dict:
             "SELECT COUNT(*) FROM document_edits WHERE doc_id = ?",
             (doc_id,)
         )
-        edit_count = cursor.fetchone()[0] if cursor.fetchone() else 0
+        result = cursor.fetchone()
+        edit_count = result[0] if result else 0
     
     # Determine status
     is_pending = doc.get("is_pending") == 1
