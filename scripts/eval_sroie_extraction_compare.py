@@ -1,143 +1,129 @@
 #!/usr/bin/env python3
 """
-Benchmark ReceiptIQ extraction on SROIE-100 using a "real app" pipeline:
-
-Pipeline (per image):
-  1) OCR (Tesseract) -> raw_text
-  2) Phi LLM parse from raw_text (extract vendor/date/total)
-  3) Donut fallback (only if missing critical fields from Phi OR low confidence)
-  4) Merge (fill missing only)
+SROIE extraction benchmark for ReceiptIQ.
 
 Modes:
-  - ocr_phi: Phi parse only (no Donut)
-  - donut_only: Donut only
-  - real_pipeline: Phi parse + Donut fallback
-  - both: run ocr_phi and real_pipeline in the same loop (no double Phi calls)
+  - ocr_phi      : OCR-only baseline, with Phi called ONLY if OCR is missing vendor/date/total
+  - donut_only   : Donut-only baseline (no OCR run)
+  - real_pipeline: OCR -> (Phi only if missing) -> Donut fallback (only if still missing OR Phi confidence below threshold)
+  - both         : runs ocr_phi then real_pipeline sequentially
 
 Outputs:
-  - Console summary
-  - CSV: outputs/sroie_compare_results.csv
+  - Prints accuracy (vendor/date/total/all-3)
+  - Prints coverage (non-null predictions)
+  - Prints latency averages
+  - Optional CSV saving via --save_csv and --csv_name
+
+This version is optimized to avoid slow Phi calls when OCR already extracted the needed fields.
 """
 
 from __future__ import annotations
 
-import sys
-import json
 import argparse
-import re
-import time
 import csv
-from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+import json
+import re
+import sys
+import time
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add project root
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.tools.vision import extract_fields_from_image
-from app.tools.llm_parser import parse_receipt_text_with_llm
-from app.tools.donut import extract_fields_donut
+from app.tools.vision import extract_fields_from_image  # OCR + regex extraction (returns vendor/date/total/raw_text)
+from app.tools.donut import extract_fields_donut        # Donut extraction (returns vendor/date/total)
+from app.tools.llm_parser import parse_receipt_text_with_llm  # Phi parsing from OCR text (may be slow)
 
 
-# -------------------------
-# Helpers: normalization & matching
-# -------------------------
+# ----------------------------
+# Normalization & matching
+# ----------------------------
 
-def normalize_string(s: Optional[str]) -> str:
+def norm_text(s: Any) -> str:
+    if s is None:
+        return ""
+    s = str(s).strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[^a-z0-9 &.'/-]+", "", s)
+    return s.strip()
+
+def vendor_match(pred: Any, gt: Any) -> bool:
+    p = norm_text(pred)
+    g = norm_text(gt)
+    if not p or not g:
+        return False
+    return (g in p) or (p in g)
+
+def _normalize_date(s: Any) -> str:
+    """Normalize a date into YYYY-MM-DD if possible."""
     if not s:
         return ""
-    return re.sub(r"[^\w]", "", str(s)).lower().strip()
-
-
-def vendor_match(extracted: Optional[str], ground_truth: Optional[str]) -> bool:
-    """Robust vendor match: case/whitespace/punctuation insensitive substring match."""
-    if not extracted or not ground_truth:
-        return False
-    e = normalize_string(extracted)
-    g = normalize_string(ground_truth)
-    return bool(e and g and ((e in g) or (g in e)))
-
-def normalize_date_for_comparison(d: str | None) -> str:
-    """Normalize many formats to YYYY-MM-DD."""
-    if not d:
-        return ""
-    s = str(d).strip()
-
-    # Strip time if present: "5/21/2018 13:48" -> "5/21/2018"
-    s = s.split(" ")[0].strip()
-    s = s.replace(".", "/").replace("\\", "/")
-
-    # Already ISO
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").strftime("%Y-%m-%d")
-    except Exception:
-        pass
-
-    # Compact YYYYMMDD
-    if re.fullmatch(r"\d{8}", s):
+    t = str(s).strip()
+    t = t.split(" ")[0].strip()
+    t = t.replace(".", "/").replace("\\", "/")
+    # try known formats
+    fmts = [
+        "%Y-%m-%d",
+        "%d-%m-%y", "%d/%m/%y",
+        "%d-%m-%Y", "%d/%m/%Y",
+        "%m/%d/%y", "%m-%d-%y",
+        "%m/%d/%Y", "%m-%d-%Y",
+        "%d/%b/%Y", "%d/%b/%y",
+        "%d-%b-%Y", "%d-%b-%y",
+    ]
+    # convert separators to consistent style for parsing
+    t_dash = t.replace("/", "-")
+    for fmt in fmts:
         try:
-            return datetime.strptime(s, "%Y%m%d").strftime("%Y-%m-%d")
+            dt = datetime.strptime(t, fmt)
+            if dt.year < 1970:
+                dt = dt.replace(year=dt.year + 100)
+            return dt.strftime("%Y-%m-%d")
         except Exception:
             pass
-
-    # Day-first formats (SROIE often DD-MM-YY)
-    for fmt in ("%d-%m-%y", "%d/%m/%y", "%d-%m-%Y", "%d/%m/%Y"):
         try:
-            dt = datetime.strptime(s, fmt)
-            # handle weird 2-digit-year pivots
+            dt = datetime.strptime(t_dash, fmt)
             if dt.year < 1970:
                 dt = dt.replace(year=dt.year + 100)
             return dt.strftime("%Y-%m-%d")
         except Exception:
-            continue
-
-    # Month-first formats
-    for fmt in ("%m/%d/%y", "%m-%d-%y", "%m/%d/%Y", "%m-%d-%Y"):
+            pass
+    # YYYYMMDD
+    if re.fullmatch(r"\d{8}", t):
         try:
-            dt = datetime.strptime(s, fmt)
-            if dt.year < 1970:
-                dt = dt.replace(year=dt.year + 100)
+            dt = datetime.strptime(t, "%Y%m%d")
             return dt.strftime("%Y-%m-%d")
         except Exception:
-            continue
-
-    # Month names: 14/JUN/2017
-    for fmt in ("%d/%b/%Y", "%d/%b/%y", "%d-%b-%Y", "%d-%b-%y"):
-        try:
-            dt = datetime.strptime(s, fmt)
-            if dt.year < 1970:
-                dt = dt.replace(year=dt.year + 100)
-            return dt.strftime("%Y-%m-%d")
-        except Exception:
-            continue
-
+            pass
     return ""
 
-
-def date_match(extracted: Optional[str], ground_truth: Optional[str]) -> bool:
-    if not extracted or not ground_truth:
-        return False
-    e = normalize_date_for_comparison(extracted)
-    g = normalize_date_for_comparison(ground_truth)
-    return bool(e and g and e == g)
+def date_match(pred: Any, gt: Any) -> bool:
+    p = _normalize_date(pred)
+    g = _normalize_date(gt)
+    return bool(p and g and p == g)
 
 def _parse_amount(x: Any) -> Optional[float]:
     if x is None:
         return None
-    # If already numeric
     if isinstance(x, (int, float)):
         return float(x)
     s = str(x).strip()
     if not s:
         return None
-    # Remove currency words/symbols and parentheses notes
+    # remove currency tokens and spaces
     s = s.replace(",", "")
-    s = re.sub(r"(?i)rm|usd|eur|gbp|inr|cad|aud|jpy", "", s)
+    s = re.sub(r"(?i)\b(rm|usd|eur|gbp|inr|cad|aud|jpy)\b", "", s)
     s = s.replace("$", "").replace("€", "").replace("£", "")
-    # Extract first plausible number (prefer decimal with 2 digits)
-    m = re.search(r"(\d+\.\d{2})", s)
+    # prefer decimal amounts (2 decimals, then 1 decimal, then any number)
+    m = re.search(r"(\d+\.\d{2})", s)  # e.g., 22.90
     if not m:
-        m = re.search(r"(\d+)", s)
+        m = re.search(r"(\d+\.\d{1})", s)  # e.g., 22.5
+    if not m:
+        m = re.search(r"(\d+)", s)  # e.g., 22
     if not m:
         return None
     try:
@@ -145,324 +131,432 @@ def _parse_amount(x: Any) -> Optional[float]:
     except Exception:
         return None
 
-def total_match(extracted: Any, ground_truth: Any, tolerance: float = 0.02) -> bool:
-    e = _parse_amount(extracted)
-    g = _parse_amount(ground_truth)
-    if e is None or g is None:
+def total_match(pred: Any, gt: Any, tolerance: float = 0.02) -> bool:
+    p = _parse_amount(pred)
+    g = _parse_amount(gt)
+    if p is None or g is None:
         return False
-    try:
-        e = float(extracted)
-        g = float(ground_truth)
-        return abs(e - g) <= tolerance
-    except Exception:
-        return False
+    return abs(p - g) <= tolerance
 
 
-# -------------------------
-# Data loader
-# -------------------------
+# ----------------------------
+# SROIE loader
+# ----------------------------
 
-def load_sroie_labels(limit: int = 100) -> List[Dict[str, Any]]:
-    labels_dir = Path(__file__).parent.parent / "data" / "sroie_100" / "labels"
+def load_sroie_samples(limit: int) -> List[Dict[str, Any]]:
+    labels_dir = PROJECT_ROOT / "data" / "sroie_100" / "labels"
     if not labels_dir.exists():
         raise SystemExit(f"❌ Labels directory not found: {labels_dir}")
 
     samples: List[Dict[str, Any]] = []
-    for json_file in sorted(labels_dir.glob("*.json"))[:limit]:
-        with open(json_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        # SROIE labels in your dataset use: company/date/total
-        gt_vendor = data.get("company") or data.get("store_name") or data.get("merchant")
-        gt_date = data.get("date")
-        gt_total = data.get("total")
-
-        # coerce total if string
+    for jf in sorted(labels_dir.glob("*.json"))[:limit]:
+        d = json.loads(jf.read_text(encoding="utf-8"))
+        gt_vendor = d.get("company") or d.get("store_name") or d.get("merchant")
+        gt_date = d.get("date")
+        gt_total = d.get("total")
         try:
             gt_total_val = float(str(gt_total).replace(",", "").strip()) if gt_total is not None else None
         except Exception:
             gt_total_val = None
-
         samples.append({
-            "file": json_file.stem,
+            "stem": jf.stem,
             "vendor": gt_vendor,
             "date": str(gt_date) if gt_date is not None else None,
             "total": gt_total_val,
         })
     return samples
 
-
-def resolve_image_path(stem: str) -> Path:
-    images_dir = Path(__file__).parent.parent / "data" / "sroie_100" / "images"
-    jpg = images_dir / f"{stem}.jpg"
-    png = images_dir / f"{stem}.png"
+def resolve_image(stem: str) -> Path:
+    img_dir = PROJECT_ROOT / "data" / "sroie_100" / "images"
+    jpg = img_dir / f"{stem}.jpg"
+    png = img_dir / f"{stem}.png"
     if jpg.exists():
         return jpg
     if png.exists():
         return png
-    return jpg  # default for printing errors
+    return jpg
 
 
-# -------------------------
-# Extraction stages (optimized)
-# -------------------------
+# ----------------------------
+# Phi parsing helpers
+# ----------------------------
 
-def run_ocr(image_path: str) -> Tuple[str, float]:
-    """Return raw_text, latency_ms."""
-    t0 = time.perf_counter()
-    ocr = extract_fields_from_image(image_path)
-    raw = ocr.get("raw_text", "") or ""
-    ms = (time.perf_counter() - t0) * 1000
-    return raw, ms
+def _extract_llm_value(llm: Any, field: str) -> Tuple[Optional[Any], Optional[float]]:
+    """
+    Supports both shapes:
+      - {"field": {"value": ..., "confidence": ...}}
+      - {"field": ...}
+    """
+    if llm is None:
+        return None, None
+    try:
+        if isinstance(llm.get(field), dict):
+            v = llm[field].get("value")
+            c = llm[field].get("confidence")
+            try:
+                c = float(c) if c is not None else None
+            except Exception:
+                c = None
+            return v, c
+        if field in llm:
+            return llm.get(field), None
+    except Exception:
+        pass
+    return None, None
 
+def _jsonish_to_dict(text: str) -> Dict[str, Any]:
+    """
+    Extract a JSON-like object from a model response.
+    Handles JSON wrapped in markdown/backticks, trailing commas, // comments,
+    and extra text before/after the JSON.
+    """
+    if not text:
+        return {}
+    t = text.strip()
 
-def run_phi_parse(raw_text: str) -> Tuple[Dict[str, Any], float]:
-    """Return parsed fields dict + latency_ms."""
-    t0 = time.perf_counter()
-    llm = parse_receipt_text_with_llm(raw_text) or {}
-    ms = (time.perf_counter() - t0) * 1000
+    # Grab first {...} block
+    m = re.search(r"\{.*?\}", t, flags=re.DOTALL)
+    if not m:
+        return {}
 
-    # Your llm_parser returns nested dicts like {"vendor":{"value":..,"confidence":..}}
-    def gv(k: str):
-        return (llm.get(k) or {}).get("value")
+    j = m.group(0)
 
-    def gc(k: str):
-        try:
-            return float((llm.get(k) or {}).get("confidence", 0))
-        except Exception:
-            return 0.0
+    # Remove // comments
+    j = re.sub(r"//.*?$", "", j, flags=re.MULTILINE)
 
-    out = {
-        "vendor": gv("vendor"),
-        "date": gv("date"),
-        "total": gv("total"),
-        "conf_vendor": gc("vendor"),
-        "conf_date": gc("date"),
-        "conf_total": gc("total"),
-    }
-    return out, ms
+    # Remove trailing commas before } or ]
+    j = re.sub(r",\s*([}\]])", r"\1", j)
 
+    # Normalize smart quotes just in case
+    j = j.replace("“", "\"").replace("”", "\"").replace("’", "'")
 
-def run_donut(image_path: str) -> Tuple[Dict[str, Any], float]:
-    t0 = time.perf_counter()
-    d = extract_fields_donut(image_path=image_path, task="sroie") or {}
-    ms = (time.perf_counter() - t0) * 1000
-    return d, ms
+    try:
+        return json.loads(j)
+    except Exception:
+        return {}
 
+def _regex_fallback_from_text(text: str) -> Dict[str, Any]:
+    """Fallback extraction when model JSON is malformed."""
+    out: Dict[str, Any] = {}
+    if not text:
+        return out
 
-def merge_fill_missing(base: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
-    """Fill only missing critical fields in base using fallback."""
-    out = dict(base)
-    for k in ("vendor", "date", "total"):
-        if (out.get(k) in (None, "", 0)) and fallback.get(k) not in (None, "", 0):
-            out[k] = fallback[k]
+    dm = re.search(r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", text)
+    if dm:
+        out["date"] = dm.group(1)
+
+    tm = re.search(r"(?i)\btotal\b[^\d]{0,20}(\d+[.,]\d{2})", text)
+    if tm:
+        out["total"] = tm.group(1)
+    else:
+        tm2 = re.search(r"(\d+[.,]\d{2})", text)
+        if tm2:
+            out["total"] = tm2.group(1)
+
     return out
 
+def parse_with_phi(raw_text: str) -> Tuple[Dict[str, Any], float]:
+    """
+    Call parse_receipt_text_with_llm(raw_text) and normalize into flat dict.
 
-# -------------------------
-# Main benchmark
-# -------------------------
+    In your repo, parse_receipt_text_with_llm may return either:
+      - a dict (preferred), OR
+      - a raw string response from Ollama.
 
-def main():
-    parser = argparse.ArgumentParser(description="SROIE benchmark: Phi vs Donut fallback (real pipeline).")
-    parser.add_argument("--limit", type=int, default=100)
-    parser.add_argument("--mode", choices=["ocr_phi", "donut_only", "real_pipeline", "both"], default="both")
-    parser.add_argument("--conf_threshold", type=float, default=0.60, help="Trigger Donut if Phi confidence below this")
-    parser.add_argument("--save_csv", action="store_true", help="Save outputs/sroie_compare_results.csv")
-    parser.add_argument(
-        "--csv_name",
-        type=str,
-        default=None,
-        help="Optional output CSV filename (e.g., outputs/sroie_real_pipeline.csv). If not set, uses a default name."
-    )
-    args = parser.parse_args()
+    This function handles both.
+    """
+    t0 = time.perf_counter()
+    llm_raw = parse_receipt_text_with_llm(raw_text)
+    ms = (time.perf_counter() - t0) * 1000.0
 
-    print(f"📊 Loading SROIE-100 samples (limit={args.limit})...")
-    samples = load_sroie_labels(args.limit)
-    print(f"   Loaded {len(samples)} samples\n")
+    # Case A: already structured dict
+    if isinstance(llm_raw, dict):
+        llm = llm_raw
+        v, cv = _extract_llm_value(llm, "vendor")
+        d, cd = _extract_llm_value(llm, "date")
+        tot, ct = _extract_llm_value(llm, "total")
 
+        if v is None:
+            v, _ = _extract_llm_value(llm, "company")
+        if tot is None:
+            tot, _ = _extract_llm_value(llm, "amount")
+
+        return {
+            "vendor": v,
+            "date": d,
+            "total": tot,
+            "conf_vendor": cv,
+            "conf_date": cd,
+            "conf_total": ct,
+        }, ms
+
+    # Case B: raw text (common with Ollama)
+    text = str(llm_raw or "")
+    data = _jsonish_to_dict(text)
+    if not data:
+        data = _regex_fallback_from_text(text)
+
+    v = data.get("vendor") or data.get("company") or data.get("merchant")
+    d = data.get("date")
+    tot = data.get("total")
+
+    return {
+        "vendor": v,
+        "date": d,
+        "total": tot,
+        "conf_vendor": None,
+        "conf_date": None,
+        "conf_total": None,
+    }, ms
+
+
+# ----------------------------
+# Benchmark core
+# ----------------------------
+
+@dataclass
+class Metrics:
+    ocr_ms: List[float]
+    phi_ms: List[float]
+    donut_ms: List[float]
+    phi_called: int = 0
+    donut_called: int = 0
+
+
+def run_mode(samples: List[Dict[str, Any]], mode: str, conf_threshold: float, save_csv: bool, csv_name: Optional[str]) -> None:
     results: List[Dict[str, Any]] = []
+    metrics = Metrics(ocr_ms=[], phi_ms=[], donut_ms=[])
 
-    # aggregate timing + coverage
-    ocr_ms_all = []
-    phi_ms_all = []
-    donut_ms_all = []
+    csv_path: Optional[Path] = None
+    csv_writer: Optional[csv.DictWriter] = None
+    csv_fh = None
 
-    donut_trigger_count = 0
+    if save_csv:
+        out_dir = PROJECT_ROOT / "outputs" / "Extraction_accuracy"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = Path(csv_name) if csv_name else (out_dir / f"sroie_{mode}.csv")
+        if not csv_path.is_absolute():
+            csv_path = (PROJECT_ROOT / csv_path).resolve()
+        csv_fh = open(csv_path, "w", newline="", encoding="utf-8")
 
-    for i, gt in enumerate(samples, 1):
-        stem = gt["file"]
-        img_path = resolve_image_path(stem)
-        if not img_path.exists():
-            print(f"⚠ {i}/{len(samples)}: Image not found: {img_path}")
-            continue
+    def write_row(row: Dict[str, Any]) -> None:
+        nonlocal csv_writer
+        if not save_csv or csv_fh is None:
+            return
+        if csv_writer is None:
+            csv_writer = csv.DictWriter(csv_fh, fieldnames=list(row.keys()))
+            csv_writer.writeheader()
+        csv_writer.writerow(row)
+        csv_fh.flush()
 
-        print(f"🔍 {i}/{len(samples)}: Processing {stem}...", end=" ", flush=True)
+    try:
+        for i, gt in enumerate(samples, 1):
+            stem = gt["stem"]
+            img_path = resolve_image(stem)
+            if not img_path.exists():
+                continue
 
-        row: Dict[str, Any] = {
-            "file": stem,
-            "gt_vendor": gt.get("vendor"),
-            "gt_date": gt.get("date"),
-            "gt_total": gt.get("total"),
-        }
+            print(f"🔍 {i}/{len(samples)}: Processing {stem}...", end=" ", flush=True)
 
-        # Stage 1 OCR once
-        raw_text, ocr_ms = run_ocr(str(img_path))
-        ocr_ms_all.append(ocr_ms)
+            pred_vendor = None
+            pred_date = None
+            pred_total = None
+            source = None
 
-        # Mode: donut_only
-        if args.mode == "donut_only":
-            donut_out, donut_ms = run_donut(str(img_path))
-            donut_ms_all.append(donut_ms)
+            latency_ocr = None
+            latency_phi = None
+            latency_donut = None
 
-            row.update({
-                "pred_vendor": donut_out.get("vendor"),
-                "pred_date": donut_out.get("date"),
-                "pred_total": donut_out.get("total"),
-                "source": "donut",
-                "latency_ocr_ms": round(ocr_ms, 2),
-                "latency_phi_ms": None,
-                "latency_donut_ms": round(donut_ms, 2),
-            })
+            raw_text = ""
 
-        else:
-            # Stage 2 Phi parse once
-            phi_out, phi_ms = run_phi_parse(raw_text)
-            phi_ms_all.append(phi_ms)
+            # ---- donut_only: no OCR at all ----
+            if mode == "donut_only":
+                t0 = time.perf_counter()
+                donut = extract_fields_donut(image_path=str(img_path), task="sroie") or {}
+                latency_donut = (time.perf_counter() - t0) * 1000.0
+                metrics.donut_ms.append(latency_donut)
+                metrics.donut_called += 1
 
-            base_pred = {
-                "vendor": phi_out.get("vendor"),
-                "date": phi_out.get("date"),
-                "total": phi_out.get("total"),
-                "source": "phi",
-            }
-
-            # Mode: ocr_phi (no donut)
-            if args.mode == "ocr_phi":
-                final_pred = base_pred
-                row.update({
-                    "pred_vendor": final_pred.get("vendor"),
-                    "pred_date": final_pred.get("date"),
-                    "pred_total": final_pred.get("total"),
-                    "source": "phi",
-                    "phi_conf_vendor": phi_out.get("conf_vendor"),
-                    "phi_conf_date": phi_out.get("conf_date"),
-                    "phi_conf_total": phi_out.get("conf_total"),
-                    "latency_ocr_ms": round(ocr_ms, 2),
-                    "latency_phi_ms": round(phi_ms, 2),
-                    "latency_donut_ms": None,
-                })
+                pred_vendor = donut.get("vendor")
+                pred_date = donut.get("date")
+                pred_total = donut.get("total")
+                source = "donut"
 
             else:
-                # Mode: real_pipeline or both
-                missing = [k for k in ("vendor", "date", "total") if not base_pred.get(k)]
-                low_conf = [k for k in ("vendor", "date", "total")
-                            if phi_out.get(f"conf_{k}", 1.0) < args.conf_threshold]
+                # ---- OCR always for ocr_phi / real_pipeline ----
+                t0 = time.perf_counter()
+                ocr = extract_fields_from_image(str(img_path)) or {}
+                latency_ocr = (time.perf_counter() - t0) * 1000.0
+                metrics.ocr_ms.append(latency_ocr)
 
-                donut_used = False
-                donut_ms = None
+                pred_vendor = ocr.get("vendor")
+                pred_date = ocr.get("date")
+                pred_total = ocr.get("total")
+                raw_text = ocr.get("raw_text", "") or ""
+                source = "ocr"
 
-                if missing or low_conf:
-                    donut_trigger_count += 1
-                    donut_out, donut_ms_val = run_donut(str(img_path))
-                    donut_used = True
-                    donut_ms = donut_ms_val
-                    donut_ms_all.append(donut_ms_val)
+                missing = [k for k, v in [("vendor", pred_vendor), ("date", pred_date), ("total", pred_total)] if not v]
 
-                    final_pred = merge_fill_missing(base_pred, donut_out)
-                    final_pred["source"] = "phi+donut"
+                # ---- OCR + Phi: only call Phi when OCR misses critical fields ----
+                if mode in ("ocr_phi", "real_pipeline") and missing:
+                    phi_out, latency_phi = parse_with_phi(raw_text)
+                    metrics.phi_ms.append(latency_phi)
+                    metrics.phi_called += 1
+
+                    # fill only missing
+                    if not pred_vendor and phi_out.get("vendor"):
+                        pred_vendor = phi_out["vendor"]
+                    if not pred_date and phi_out.get("date"):
+                        pred_date = phi_out["date"]
+                    if not pred_total and phi_out.get("total") is not None:
+                        pred_total = phi_out["total"]
+                    source = "ocr+phi"
+
+                    # store confidences for fallback decision
+                    conf_vendor = phi_out.get("conf_vendor")
+                    conf_date = phi_out.get("conf_date")
+                    conf_total = phi_out.get("conf_total")
                 else:
-                    final_pred = base_pred
+                    conf_vendor = conf_date = conf_total = None
 
-                row.update({
-                    "pred_vendor": final_pred.get("vendor"),
-                    "pred_date": final_pred.get("date"),
-                    "pred_total": final_pred.get("total"),
-                    "source": final_pred.get("source"),
-                    "phi_conf_vendor": phi_out.get("conf_vendor"),
-                    "phi_conf_date": phi_out.get("conf_date"),
-                    "phi_conf_total": phi_out.get("conf_total"),
-                    "donut_used": donut_used,
-                    "latency_ocr_ms": round(ocr_ms, 2),
-                    "latency_phi_ms": round(phi_ms, 2),
-                    "latency_donut_ms": round(donut_ms, 2) if donut_ms is not None else None,
-                })
+                # ---- Donut fallback (real pipeline only) ----
+                if mode == "real_pipeline":
+                    still_missing = [k for k, v in [("vendor", pred_vendor), ("date", pred_date), ("total", pred_total)] if not v]
 
-        # Matches
-        row["vendor_match"] = vendor_match(row.get("pred_vendor"), gt.get("vendor"))
-        row["date_match"] = date_match(row.get("pred_date"), gt.get("date"))
-        row["total_match"] = total_match(row.get("pred_total"), gt.get("total"))
-        row["all3_match"] = bool(row["vendor_match"] and row["date_match"] and row["total_match"])
+                    low_conf = []
+                    # Only treat confidence as low if it is present (not None)
+                    if conf_vendor is not None and conf_vendor < conf_threshold:
+                        low_conf.append("vendor")
+                    if conf_date is not None and conf_date < conf_threshold:
+                        low_conf.append("date")
+                    if conf_total is not None and conf_total < conf_threshold:
+                        low_conf.append("total")
 
-        results.append(row)
-        print("✅")
+                    if still_missing or low_conf:
+                        t0 = time.perf_counter()
+                        donut = extract_fields_donut(image_path=str(img_path), task="sroie") or {}
+                        latency_donut = (time.perf_counter() - t0) * 1000.0
+                        metrics.donut_ms.append(latency_donut)
+                        metrics.donut_called += 1
 
-    # -------------------------
-    # Summary
-    # -------------------------
+                        # fill missing only
+                        if not pred_vendor and donut.get("vendor"):
+                            pred_vendor = donut["vendor"]
+                        if not pred_date and donut.get("date"):
+                            pred_date = donut["date"]
+
+                        # Total: prefer Donut when it provides a plausible total and Phi/OCR disagrees.
+                        d_tot = donut.get("total")
+                        if d_tot is not None:
+                            if pred_total is None:
+                                pred_total = d_tot
+                            else:
+                                p_amt = _parse_amount(pred_total)
+                                d_amt = _parse_amount(d_tot)
+                                # If both parse and differ materially, prefer Donut (layout-aware model)
+                                if p_amt is not None and d_amt is not None and abs(p_amt - d_amt) > 0.05:
+                                    pred_total = d_tot
+
+                        source = (source or "ocr") + "+donut"
+
+            row = {
+                "file": stem,
+                "gt_vendor": gt.get("vendor"),
+                "gt_date": gt.get("date"),
+                "gt_total": gt.get("total"),
+                "pred_vendor": pred_vendor,
+                "pred_date": pred_date,
+                "pred_total": pred_total,
+                "source": source,
+                "latency_ocr_ms": round(latency_ocr, 2) if latency_ocr is not None else None,
+                "latency_phi_ms": round(latency_phi, 2) if latency_phi is not None else None,
+                "latency_donut_ms": round(latency_donut, 2) if latency_donut is not None else None,
+            }
+
+            row["vendor_match"] = vendor_match(row.get("pred_vendor"), gt.get("vendor"))
+            row["date_match"] = date_match(row.get("pred_date"), gt.get("date"))
+            row["total_match"] = total_match(row.get("pred_total"), gt.get("total"))
+            row["all3_match"] = bool(row["vendor_match"] and row["date_match"] and row["total_match"])
+
+            results.append(row)
+            write_row(row)
+
+            print("✅")
+
+    finally:
+        if csv_fh is not None:
+            csv_fh.close()
+
+    # ---- summary ----
     n = len(results)
     print("\n" + "=" * 80)
     print("📈 Results Summary")
     print("=" * 80)
-    print(f"N evaluated: {n}")
+    print(f"N evaluated: {n}\n")
 
     if n == 0:
-        print("No samples evaluated (check image/label paths).")
+        print("No samples evaluated.")
         return
 
-    vendor_acc = sum(r["vendor_match"] for r in results) / n
-    date_acc = sum(r["date_match"] for r in results) / n
-    total_acc = sum(r["total_match"] for r in results) / n
-    all3_acc = sum(r["all3_match"] for r in results) / n
+    vendor_acc = sum(1 for r in results if r["vendor_match"]) / n
+    date_acc = sum(1 for r in results if r["date_match"]) / n
+    total_acc = sum(1 for r in results if r["total_match"]) / n
+    all3_acc = sum(1 for r in results if r["all3_match"]) / n
 
-    # Coverage
-    cov_vendor = sum(1 for r in results if r.get("pred_vendor")) / n
-    cov_date = sum(1 for r in results if r.get("pred_date")) / n
-    cov_total = sum(1 for r in results if r.get("pred_total") not in (None, "", 0)) / n
-
-    print(f"\nAccuracy:")
+    print("Accuracy:")
     print(f"  Vendor: {vendor_acc*100:6.2f}%")
     print(f"  Date:   {date_acc*100:6.2f}%")
     print(f"  Total:  {total_acc*100:6.2f}%")
-    print(f"  All-3:  {all3_acc*100:6.2f}%")
+    print(f"  All-3:  {all3_acc*100:6.2f}%\n")
 
-    print(f"\nCoverage (non-null predictions):")
+    cov_vendor = sum(1 for r in results if r.get("pred_vendor")) / n
+    cov_date = sum(1 for r in results if r.get("pred_date")) / n
+    cov_total = sum(1 for r in results if r.get("pred_total") is not None) / n
+
+    print("Coverage (non-null predictions):")
     print(f"  Vendor filled: {cov_vendor*100:6.2f}%")
     print(f"  Date filled:   {cov_date*100:6.2f}%")
-    print(f"  Total filled:  {cov_total*100:6.2f}%")
+    print(f"  Total filled:  {cov_total*100:6.2f}%\n")
 
-    # Timing
-    def avg(xs):
-        return sum(xs)/len(xs) if xs else 0
+    def avg(xs: List[float]) -> float:
+        return (sum(xs) / len(xs)) if xs else 0.0
 
-    print(f"\nLatency (avg ms):")
-    print(f"  OCR:   {avg(ocr_ms_all):8.2f} ms")
-    if phi_ms_all:
-        print(f"  Phi:   {avg(phi_ms_all):8.2f} ms")
-    if donut_ms_all:
-        print(f"  Donut: {avg(donut_ms_all):8.2f} ms  (called on {donut_trigger_count}/{n} images)")
+    print("Latency (avg ms):")
+    if metrics.ocr_ms:
+        print(f"  OCR:   {avg(metrics.ocr_ms):8.2f} ms")
+    if metrics.phi_ms:
+        print(f"  Phi:   {avg(metrics.phi_ms):8.2f} ms  (called on {metrics.phi_called}/{len(samples)} images)")
+    if metrics.donut_ms:
+        print(f"  Donut: {avg(metrics.donut_ms):8.2f} ms  (called on {metrics.donut_called}/{len(samples)} images)")
+    print("")
 
-    # Save CSV
-    if args.save_csv:
-        output_dir = Path(__file__).parent.parent / "outputs"
-        output_dir.mkdir(exist_ok=True)
+    if save_csv and csv_path is not None:
+        print(f"💾 Saved CSV to: {csv_path}\n")
 
-        if args.csv_name:
-            csv_path = Path(args.csv_name)
-            # If user passed relative path, keep it under repo root
-            if not csv_path.is_absolute():
-                csv_path = (Path(__file__).parent.parent / csv_path).resolve()
-        else:
-            # default unique name by mode
-            csv_path = output_dir / f"sroie_compare_results_{args.mode}.csv"
+    print("Done.")
 
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(results[0].keys()))
-            writer.writeheader()
-            writer.writerows(results)
 
-        print(f"\n💾 Saved CSV to: {csv_path}")
-    print("\nDone.")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="SROIE benchmark: OCR vs Phi vs Donut (optimized runtime).")
+    parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--mode", choices=["ocr_phi", "donut_only", "real_pipeline", "both"], default="both")
+    parser.add_argument("--conf_threshold", type=float, default=0.60, help="Trigger Donut if Phi confidence below this (only if confidence is present).")
+    parser.add_argument("--save_csv", action="store_true")
+    parser.add_argument("--csv_name", type=str, default=None)
+    args = parser.parse_args()
+
+    print(f"📊 Loading SROIE-100 samples (limit={args.limit})...")
+    samples = load_sroie_samples(args.limit)
+    print(f"   Loaded {len(samples)} samples\n")
+
+    if args.mode == "both":
+        # run twice, printing two summaries; CSV (if enabled) will use separate files
+        run_mode(samples, "ocr_phi", args.conf_threshold, args.save_csv, args.csv_name or f"outputs/Extraction_accuracy/sroie_ocr_phi.csv")
+        print("\n\n")
+        run_mode(samples, "real_pipeline", args.conf_threshold, args.save_csv, args.csv_name or f"outputs/Extraction_accuracy/sroie_real_pipeline.csv")
+        return
+
+    run_mode(samples, args.mode, args.conf_threshold, args.save_csv, args.csv_name)
 
 
 if __name__ == "__main__":

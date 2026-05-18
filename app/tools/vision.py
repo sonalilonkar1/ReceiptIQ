@@ -667,9 +667,9 @@ def extract_fields_from_image(image_path: str) -> dict:
         "vendor_candidates": vendor_candidates,
         "date_candidates": date_candidates,
         "total_candidates": total_candidates,
-        "vendor_guess": vendor_guess,
-        "date_guess": date_guess,
-        "total_guess": total_guess,
+        "vendor": vendor_guess,
+        "date": date_guess,
+        "total": total_guess,
         "description": f"Receipt from {vendor_guess}" if vendor_guess else "Receipt",
     }
 

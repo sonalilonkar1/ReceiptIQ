@@ -404,7 +404,8 @@ def build_app() -> gr.Blocks:
                         close_form_btn = gr.Button("✕ Close", variant="secondary", scale=1)
                     
                     with gr.Row():
-                        edit_vendor = gr.Dropdown(label="Vendor (choose from candidates)", choices=[], value=None, scale=2)
+                        vendor_display = gr.Textbox(label="Vendor", interactive=False, scale=2)
+                        edit_vendor = gr.Dropdown(label="Vendor (choose from candidates)", choices=[], value=None, scale=2, visible=False)
                         edit_category = gr.Dropdown(
                             choices=["meals", "travel", "supplies", "other"],
                             label="Category",
@@ -413,8 +414,10 @@ def build_app() -> gr.Blocks:
                         )
                     
                     with gr.Row():
-                        edit_date = gr.Dropdown(label="Date (choose from candidates)", choices=[], value=None, scale=1)
-                        edit_total = gr.Dropdown(label="Total (choose from candidates)", choices=[], value=None, scale=1)
+                        date_display = gr.Textbox(label="Date", interactive=False, scale=1)
+                        edit_date = gr.Dropdown(label="Date (choose from candidates)", choices=[], value=None, scale=1, visible=False)
+                        total_display = gr.Textbox(label="Total", interactive=False, scale=1)
+                        edit_total = gr.Dropdown(label="Total (choose from candidates)", choices=[], value=None, scale=1, visible=False)
                     
                     with gr.Row():
                         save_btn = gr.Button("💾 Save Changes", variant="primary", scale=2)
@@ -432,7 +435,20 @@ def build_app() -> gr.Blocks:
                     """Load receipt data when radio button selected and show form."""
                     if not selected_label:
                         log_receipt("No receipt selected")
-                        return 0, "other", gr.update(choices=["(keep pending / none of these)"], value=None), gr.update(choices=["(keep pending / none of these)"], value=None), gr.update(choices=["(keep pending / none of these)"], value=None), "No receipt selected", gr.update(visible=False)
+                        keep = "(keep pending / none of these)"
+                        # IMPORTANT: must return ALL 10 output values for Gradio.
+                        return (
+                            0,  # selected_doc_id
+                            "",  # vendor_display
+                            gr.update(choices=[keep], value=keep, visible=False),  # edit_vendor
+                            "other",  # edit_category
+                            "",  # date_display
+                            gr.update(choices=[keep], value=keep, visible=False),  # edit_date
+                            "",  # total_display
+                            gr.update(choices=[keep], value=keep, visible=False),  # edit_total
+                            "No receipt selected",
+                            gr.update(visible=False),
+                        )
                     
                     log_receipt(f"LOAD OPERATION STARTED - User selected: {selected_label}")
                     
@@ -484,7 +500,7 @@ def build_app() -> gr.Blocks:
                                     return opts
                                 
                                 vendor_choices = fmt_choices("vendor")
-                                date_choices = fmt_choices("date")
+                                date_choices = fmt_choices("doc_date")
                                 
                                 total_choices = ["(keep pending / none of these)"]
                                 for item in (cands.get("total") or [])[:8]:
@@ -497,28 +513,127 @@ def build_app() -> gr.Blocks:
                                         if label not in total_choices:
                                             total_choices.append(label)
                                 
-                                vendor_val = vendor if vendor else None
-                                date_val = date if date else None
+                                def pick_value(choices, raw):
+                                    if not raw:
+                                        return None
+                                    raw_s = str(raw).strip()
+                                    if not raw_s:
+                                        return None
+                                    # Prefer exact match on the value portion (before evidence delimiter)
+                                    for c in choices:
+                                        c0 = c.split("—", 1)[0].strip()
+                                        if c0 == raw_s:
+                                            return c
+                                    # Case-insensitive startswith/contains
+                                    raw_low = raw_s.lower()
+                                    for c in choices:
+                                        c0 = c.split("—", 1)[0].strip()
+                                        if c0.lower().startswith(raw_low) or raw_low in c0.lower():
+                                            return c
+                                    return None
+
+                                vendor_val = pick_value(vendor_choices, vendor)
+                                date_val = pick_value(date_choices, date)
                                 total_val = None
                                 if isinstance(total, (int, float)) and total > 0:
-                                    total_val = f"total: {float(total)}"
-                                
-                                                                
+                                    total_val = pick_value(total_choices, f"total: {float(total):.2f}") or pick_value(total_choices, f"total: {float(total)}")
+                                # Determine which fields are missing.
+                                # Use missing_fields as the source of truth so we only show dropdowns
+                                # for fields that actually caused the receipt to be pending.
+                                # (Fallback only if missing_fields is empty for legacy rows.)
+                                missing_raw = str(item.get('missing_fields') or '').lower()
+                                missing_set = {x.strip() for x in re.split(r"[,\s]+", missing_raw) if x.strip()}
+                                is_missing_vendor = ('vendor' in missing_set) or (not missing_set and not vendor.strip())
+                                is_missing_date = (('date' in missing_set) or ('doc_date' in missing_set)) or (not missing_set and not date.strip())
+                                is_missing_total = ('total' in missing_set) or (not missing_set and (item.get('total') is None))
+
+                                keep_label = '(keep pending / none of these)'
+
+                                def _ensure_choices(field: str, existing_label: str | None, choices: list[str] | None):
+                                    choices = list(choices or [])
+                                    if keep_label not in choices:
+                                        choices.insert(0, keep_label)
+                                    if existing_label and existing_label not in choices:
+                                        choices.insert(1, existing_label)
+                                    return choices
+
+                                # Always show the fields; disable dropdown if not missing.
+                                vendor_existing_label = vendor_val or (f"vendor: {vendor.strip()} — (existing value)" if vendor.strip() else None)
+                                date_existing_label = date_val or (f"date: {date.strip()} — (existing value)" if date.strip() else None)
+                                total_existing_label = total_val or (f"total: {float(item.get('total')):.2f} — (existing value)" if isinstance(item.get('total'), (int,float)) else None)
+
+                                vendor_choices = _ensure_choices('vendor', vendor_existing_label, vendor_choices)
+                                date_choices = _ensure_choices('date', date_existing_label, date_choices)
+                                total_choices = _ensure_choices('total', total_existing_label, total_choices)
+
+                                vendor_value = vendor_existing_label if vendor_existing_label else keep_label
+                                date_value = date_existing_label if date_existing_label else keep_label
+                                total_value = total_existing_label if total_existing_label else keep_label
+
+                                # Display current values always; show dropdowns only for missing fields.
+                                current_total_str = "" if item.get('total') is None else f"{float(item.get('total')):.2f}"
+                                # Reset hidden dropdowns to avoid stale choices/values persisting
+                                vendor_dd = gr.update(
+                                    choices=vendor_choices if is_missing_vendor else [keep_label],
+                                    value=keep_label,
+                                    visible=is_missing_vendor,
+                                    interactive=True,
+                                )
+                                date_dd = gr.update(
+                                    choices=date_choices if is_missing_date else [keep_label],
+                                    value=keep_label,
+                                    visible=is_missing_date,
+                                    interactive=True,
+                                )
+                                total_dd = gr.update(
+                                    choices=total_choices if is_missing_total else [keep_label],
+                                    value=keep_label,
+                                    visible=is_missing_total,
+                                    interactive=True,
+                                )
+
                                 return (
                                     doc_id_int,
+                                    vendor.strip(),
+                                    vendor_dd,
                                     category,
-                                    gr.update(choices=vendor_choices, value=vendor_val),
-                                    gr.update(choices=date_choices, value=date_val),
-                                    gr.update(choices=total_choices, value=total_val),
+                                    date.strip(),
+                                    date_dd,
+                                    current_total_str,
+                                    total_dd,
                                     f"✓ Loaded doc #{doc_id_int} (choose candidates to fill missing fields)",
                                     gr.update(visible=True),
                                 )
                         
                         log_receipt(f"❌ Receipt not found for label: {selected_label}")
-                        return 0, "other", "", "", 0, "Receipt not found", gr.update(visible=False)
+                        keep = "(keep pending / none of these)"
+                        return (
+                            0,
+                            "",
+                            gr.update(choices=[keep], value=keep, visible=False),
+                            "other",
+                            "",
+                            gr.update(choices=[keep], value=keep, visible=False),
+                            "",
+                            gr.update(choices=[keep], value=keep, visible=False),
+                            "Receipt not found",
+                            gr.update(visible=False),
+                        )
                     except Exception as e:
                         log_receipt(f"❌ ERROR loading receipt: {str(e)}")
-                        return 0, "other", "", "", 0, f"Error: {str(e)}", gr.update(visible=False)
+                        keep = "(keep pending / none of these)"
+                        return (
+                            0,
+                            "",
+                            gr.update(choices=[keep], value=keep, visible=False),
+                            "other",
+                            "",
+                            gr.update(choices=[keep], value=keep, visible=False),
+                            "",
+                            gr.update(choices=[keep], value=keep, visible=False),
+                            f"Error: {str(e)}",
+                            gr.update(visible=False),
+                        )
                 
                 # Handler: Save changes with high-risk edit warning
                 def save_pending_changes(doc_id, vendor, category, date, total, confirm_data):
@@ -542,13 +657,13 @@ def build_app() -> gr.Blocks:
                         
                         # Build updates dict
                         updates = {}
-                        if vendor and isinstance(vendor, str) and not vendor.startswith("(keep pending"):
+                        if vendor and isinstance(vendor, str ) and "existing value" not in vendor and not vendor.startswith("(keep pending" ) and "existing value" not in vendor:
                             updates["vendor"] = vendor.split(" — ", 1)[0].strip()
                         if category and category.strip():
                             updates["category"] = category.strip()
-                        if date and isinstance(date, str) and not date.startswith("(keep pending"):
+                        if date and isinstance(date, str ) and "existing value" not in date and not date.startswith("(keep pending" ) and "existing value" not in date:
                             updates["doc_date"] = date.split(" — ", 1)[0].strip()
-                        if total and isinstance(total, str) and not total.startswith("(keep pending"):
+                        if total and isinstance(total, str ) and "existing value" not in total and not total.startswith("(keep pending" ) and "existing value" not in total:
                             m = re.search(r"([-+]?[0-9]*\.?[0-9]+)", total)
                             if m:
                                 updates["total"] = float(m.group(1))
@@ -598,9 +713,16 @@ def build_app() -> gr.Blocks:
                                         updates = confirm_data.get("pending_updates", updates)
                         
                         # Apply auto-clear pending status
-                        has_vendor = updates.get("vendor") or (vendor and vendor.strip())
-                        has_date = updates.get("doc_date") or (date and date.strip())
-                        has_total = updates.get("total") or (total and total > 0)
+                        # Use DB state (plus any updates) so hidden dropdowns don't accidentally look "empty".
+                        current_doc = get_document_by_id(doc_id_int) or {}
+                        cur_vendor_db = (current_doc.get("vendor") or "").strip()
+                        cur_date_db = (current_doc.get("doc_date") or "").strip()
+                        cur_total_db = current_doc.get("total")
+
+                        has_vendor = bool((updates.get("vendor") or cur_vendor_db).strip())
+                        has_date = bool((updates.get("doc_date") or cur_date_db).strip())
+                        has_total_val = updates.get("total") if "total" in updates else cur_total_db
+                        has_total = has_total_val is not None and float(has_total_val) > 0
                         
                         log_receipt(f"Pending clear check: vendor={bool(has_vendor)}, date={bool(has_date)}, total={bool(has_total)}", doc_id_int)
                         
@@ -683,7 +805,14 @@ def build_app() -> gr.Blocks:
                 )
 # Handler: Clear form
                 def clear_form():
-                    return 0, "other", "", "", 0, "Cleared"
+                    return (
+                        0,
+                        "other",
+                        gr.update(choices=["(keep pending / none of these)"], value=None, visible=True),
+                        gr.update(choices=["(keep pending / none of these)"], value=None, visible=True),
+                        gr.update(choices=["(keep pending / none of these)"], value=None, visible=True),
+                        "Cleared",
+                    )
                 
                 clear_btn.click(
                     clear_form,
@@ -711,7 +840,12 @@ def build_app() -> gr.Blocks:
                         gr.update(visible=new_has_pending),
                         gr.update(visible=not new_has_pending),
                         gr.update(visible=False),
-                        0, "other", "", "", 0, "✓ Refreshed - select a receipt"
+                        0,
+                        "other",
+                        gr.update(choices=["(keep pending / none of these)"], value=None, visible=True),
+                        gr.update(choices=["(keep pending / none of these)"], value=None, visible=True),
+                        gr.update(choices=["(keep pending / none of these)"], value=None, visible=True),
+                        "✓ Refreshed - select a receipt",
                     )
                 
                 refresh_pending_btn.click(
@@ -724,7 +858,18 @@ def build_app() -> gr.Blocks:
                 pending_radio.change(
                     on_radio_select,
                     [pending_radio],
-                    [selected_doc_id, edit_category, edit_vendor, edit_date, edit_total, status_msg, edit_form_group],
+                    [
+                        selected_doc_id,
+                        vendor_display,
+                        edit_vendor,
+                        edit_category,
+                        date_display,
+                        edit_date,
+                        total_display,
+                        edit_total,
+                        status_msg,
+                        edit_form_group,
+                    ],
                 )
 
 

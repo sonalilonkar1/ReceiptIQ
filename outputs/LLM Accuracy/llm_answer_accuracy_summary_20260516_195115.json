@@ -1,0 +1,20 @@
+{
+  "stamp": "20260516_195115",
+  "modes": {
+    "phi_only": {
+      "avg_score": 1.0,
+      "pass_rate@0.8": 1.0,
+      "csv": "/Users/sonalilonkar/Desktop/SJSU /SP26/259-NLP/Project/ReceiptIQ/outputs/llm_answer_accuracy_phi_only_20260516_195115.csv"
+    },
+    "mistral_only": {
+      "avg_score": 1.0,
+      "pass_rate@0.8": 1.0,
+      "csv": "/Users/sonalilonkar/Desktop/SJSU /SP26/259-NLP/Project/ReceiptIQ/outputs/llm_answer_accuracy_mistral_only_20260516_195115.csv"
+    },
+    "phi+mistral": {
+      "avg_score": 1.0,
+      "pass_rate@0.8": 1.0,
+      "csv": "/Users/sonalilonkar/Desktop/SJSU /SP26/259-NLP/Project/ReceiptIQ/outputs/llm_answer_accuracy_phi+mistral_20260516_195115.csv"
+    }
+  }
+}

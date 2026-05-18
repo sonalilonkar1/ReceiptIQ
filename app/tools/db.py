@@ -2,12 +2,21 @@
 
 from pathlib import Path
 import sqlite3
-import json
 import re
-from datetime import datetime
+import math
+import os
+from datetime import datetime, timedelta
 
 
-DB_PATH = Path(__file__).resolve().parents[2] / "receiptiq.sqlite"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Allow pointing to a different DB file (useful for benchmarks / per-model evaluation)
+_DB_ENV = os.getenv("RECEIPTIQ_DB_PATH") or os.getenv("RECEIPTIQ_SQLITE_PATH")
+if _DB_ENV:
+    p = Path(_DB_ENV).expanduser()
+    DB_PATH = (p if p.is_absolute() else (_REPO_ROOT / p)).resolve()
+else:
+    DB_PATH = (_REPO_ROOT / "receiptiq.sqlite").resolve()
 ALLOWED_CURRENCIES = {"USD", "EUR", "GBP", "INR", "CAD", "AUD", "JPY"}
 MAX_TOTAL = 10000.0
 
@@ -161,6 +170,284 @@ def get_document_by_id(doc_id: int) -> dict:
             "raw_text": row[14],
             "created_at": row[15],
         }
+
+
+
+def get_doc_candidates(doc_id: int, max_candidates: int = 5) -> dict:
+    """Return candidate values (with evidence lines) for missing-field editing in the UI.
+
+    This is intentionally lightweight and fast: it only uses the stored raw_text
+    (no OCR/LLM calls). The UI can present these as dropdown options so the user
+    chooses from extracted evidence instead of typing arbitrary text.
+
+    Returns:
+        {
+          "vendor":    [{"value": str, "evidence": str}, ...],
+          "doc_date":  [{"value": "YYYY-MM-DD", "evidence": str}, ...],
+          "total":     [{"value": float, "evidence": str}, ...],
+        }
+    """
+    doc = get_document_by_id(int(doc_id)) or {}
+    raw = (doc.get("raw_text") or "").strip()
+
+    out = {"vendor": [], "doc_date": [], "total": []}
+    if not raw:
+        # Fall back to existing structured fields if present
+        if doc.get("vendor"):
+            out["vendor"].append({"value": doc["vendor"], "evidence": "(existing value)"})
+        if doc.get("doc_date"):
+            out["doc_date"].append({"value": doc["doc_date"], "evidence": "(existing value)"})
+        if doc.get("total") is not None:
+            out["total"].append({"value": float(doc["total"]), "evidence": "(existing value)"})
+        return out
+
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    head = lines[:12]
+
+    def _add_unique(key: str, value, evidence: str):
+        if value is None:
+            return
+        # normalize comparison key
+        if key in ("vendor",):
+            norm = re.sub(r"\s+", " ", str(value).strip().lower())
+        elif key in ("doc_date",):
+            norm = str(value).strip()
+        else:  # total
+            try:
+                norm = f"{float(value):.2f}"
+            except Exception:
+                return
+        for it in out[key]:
+            if key == "total":
+                try:
+                    if abs(float(it["value"]) - float(value)) <= 0.009:
+                        return
+                except Exception:
+                    continue
+            else:
+                if re.sub(r"\s+", " ", str(it["value"]).strip().lower()) == norm.lower():
+                    return
+        out[key].append({"value": value, "evidence": evidence})
+
+    # --- Vendor candidates ---
+    # Always include existing vendor (if any) as a choice.
+    if doc.get("vendor"):
+        _add_unique("vendor", doc["vendor"], "(existing value)")
+
+    # Tokens that frequently indicate header noise instead of a merchant name.
+    # Keep as a set because we intersect with tokenized candidates.
+    bad_vendor_tokens = {
+        "subtotal", "total", "tax", "amount", "date", "time", "server", "cashier",
+        "receipt", "invoice", "thank", "thanks", "survey", "feedback", "www", "http",
+        "phone", "tel", "call", "twitter", "facebook", "instagram",
+        "street", "st", "rd", "ave", "blvd", "drive", "dr", "road", "zip", "postcode",
+        "city", "state", "county",
+    }
+
+    def _vendor_score(s: str) -> float:
+        s = s.strip()
+        if len(s) < 3:
+            return -1e9
+        low = s.lower()
+        toks = set(re.findall(r"[a-z]+", low))
+        bad = len(toks & bad_vendor_tokens)
+        # penalize URLs and email-like
+        if "@" in s or "://" in s:
+            return -10.0
+        # digit ratio
+        digit_ratio = sum(ch.isdigit() for ch in s) / max(1, len(s))
+        score = 0.0
+        score -= bad * 3.0
+        if 3 <= len(s) <= 48:
+            score += 3.0
+        if digit_ratio > 0.20:
+            score -= 6.0
+        # uppercase boost (common vendor headers)
+        if s.isupper():
+            score += 1.5
+        # looks like location "CITY ST"
+        if re.search(r"\b[A-Z]{2}\b", s) and len(s.split()) in (2, 3, 4):
+            score -= 4.0
+        # has at least 3 letters
+        if sum(ch.isalpha() for ch in s) < 3:
+            score -= 5.0
+        return score
+
+    vendor_ranked = sorted(
+        [(ln, _vendor_score(ln)) for ln in head],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    for ln, sc in vendor_ranked:
+        if sc < 1.0:
+            continue
+        # clean mild OCR noise but keep original evidence
+        cand = re.sub(r"[^\w&'.,\- ]+", " ", ln).strip()
+        cand = re.sub(r"\s+", " ", cand)
+        if cand and not cand[0].isdigit():
+            _add_unique("vendor", cand, ln)
+        if len(out["vendor"]) >= max_candidates:
+            break
+
+    # --- Date candidates ---
+    # Match common formats and normalize to YYYY-MM-DD using your existing _normalize_date()
+    date_regexes = [
+        r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b",
+        r"\b(\d{1,2}-\d{1,2}-\d{2,4})\b",
+        r"\b(\d{4}-\d{1,2}-\d{1,2})\b",
+    ]
+    for ln in lines[:25]:
+        for rx in date_regexes:
+            for m in re.finditer(rx, ln):
+                raw_d = m.group(1)
+                try:
+                    norm = _normalize_date(raw_d)
+                except Exception:
+                    norm = None
+                if norm:
+                    _add_unique("doc_date", norm, ln)
+
+                    # UI convenience: include +/- 1 and +/- 2 days around a detected date.
+                    # This helps when the OCR date is off by a day or two.
+                    try:
+                        base = datetime.strptime(norm, "%Y-%m-%d")
+                        for delta in (-2, -1, 1, 2):
+                            cand = base + timedelta(days=delta)
+                            _add_unique(
+                                "doc_date",
+                                cand.strftime("%Y-%m-%d"),
+                                f"{ln} (±{abs(delta)} day from detected date)",
+                            )
+                    except Exception:
+                        pass
+        if len(out["doc_date"]) >= max_candidates:
+            break
+    if doc.get("doc_date"):
+        _add_unique("doc_date", doc["doc_date"], "(existing value)")
+
+    # If we couldn't detect any dates from raw text, fall back to created_at
+    # (bounded, safe options; avoids forcing free-text input).
+    if not out["doc_date"]:
+        created_at = (doc.get("created_at") or "").strip()
+        # created_at is typically "YYYY-MM-DD HH:MM:SS"
+        try:
+            base_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            base_date = base_dt.date()
+            today = datetime.now().date()
+            _add_unique("doc_date", base_date.strftime("%Y-%m-%d"), "(from created_at)")
+            for delta in (-2, -1, 1, 2):
+                cand = base_date + timedelta(days=delta)
+                # Avoid suggesting future dates.
+                if cand > today:
+                    continue
+                _add_unique(
+                    "doc_date",
+                    cand.strftime("%Y-%m-%d"),
+                    f"(from created_at ±{abs(delta)} day)",
+                )
+        except Exception:
+            pass
+
+    # --- Total candidates ---
+    # Strategy:
+    #  1) Prefer explicit TOTAL / AMOUNT DUE lines.
+    #  2) Avoid CASH / CHANGE lines that often appear after payment.
+    #  3) Keep top unique plausible amounts.
+    strong_kw = re.compile(r"\b(total|amount\s*due|grand\s*total|balance\s*due|to\s*pay|amt\s*due|to\s*stay\s*total)\b", re.I)
+    weak_kw = re.compile(r"\b(subtotal|tax|tip)\b", re.I)
+    pay_kw = re.compile(r"\b(cash|change)\b", re.I)
+
+    # Reject common false positives (phone numbers, addresses, URLs).
+    phone_pat = re.compile(r"(\(\d{3}\)\s*\d{3}[-\s]?\d{4})|(\b\d{3}[-\s]\d{3}[-\s]\d{4}\b)")
+    addr_kw = [
+        "phone",
+        "tel",
+        "telephone",
+        "call",
+        "fax",
+        "street",
+        " st ",
+        " st.",
+        "avenue",
+        " ave",
+        "road",
+        " rd",
+        "lane",
+        " ln",
+        "blvd",
+        "drive",
+        " dr",
+        "suite",
+        " ste",
+        "zip",
+        "postcode",
+        "po box",
+        "www",
+        "http",
+    ]
+
+    totals = []
+    scan_lines = lines[:60]
+    n_scan = len(scan_lines)
+    for idx, ln in enumerate(scan_lines):
+        line = (ln or "").strip()
+        if not line:
+            continue
+
+        low_line = line.lower()
+        if phone_pat.search(line):
+            continue
+        if any(k in low_line for k in addr_kw) and any(ch.isdigit() for ch in low_line):
+            continue
+
+        line_bonus = 0.5
+        if strong_kw.search(line):
+            line_bonus += 6.0
+        if weak_kw.search(line) and not strong_kw.search(line):
+            line_bonus -= 1.5
+        if pay_kw.search(line) and not strong_kw.search(line):
+            line_bonus -= 4.0
+
+        for m in re.finditer(r"(\$?\s*\d[\d,]*\.\d{2})", line):
+            totals.append((m.group(1), line, line_bonus, idx, n_scan))
+
+    def _to_float(s: str) -> float | None:
+        try:
+            s = s.replace("$", "").strip()
+            s = s.replace(",", "")
+            return float(s)
+        except Exception:
+            return None
+
+    scored = []
+    for amt_s, ln, bonus, idx, n_scan in totals:
+        val = _to_float(amt_s)
+        if val is None:
+            continue
+        # filter out tiny line-item values
+        if val < 0.5:
+            continue
+        if val > MAX_TOTAL:
+            continue
+
+        low_ln = (ln or "").lower()
+        has_currency = ("$" in ln) or ("usd" in low_ln) or ("eur" in low_ln)
+        # If there's no keyword/currency signal, only trust amounts near the bottom.
+        if bonus <= 0.6 and not has_currency:
+            if idx < max(0, n_scan - 15):
+                continue
+        # score: keyword bonus dominates; prefer larger values slightly
+        scored.append((val, ln, bonus + min(val / 100.0, 3.0)))
+    scored.sort(key=lambda x: x[2], reverse=True)
+
+    for val, ln, _sc in scored:
+        _add_unique("total", float(f"{val:.2f}"), ln)
+        if len(out["total"]) >= max_candidates:
+            break
+    if doc.get("total") is not None:
+        _add_unique("total", float(doc["total"]), "(existing value)")
+
+    return out
 
 
 def get_audit_flags(doc_id: int) -> list[dict]:
@@ -1078,7 +1365,7 @@ def update_document(doc_id: int, updates: dict) -> None:
     """
     allowed_fields = {
         "vendor", "doc_date", "total", "tax", "subtotal", "currency",
-        "category", "invoice_number", "description", "is_pending", "reimbursable"
+        "category", "invoice_number", "description", "is_pending"
     }
 
     filtered_updates = {k: v for k, v in updates.items() if k in allowed_fields}
@@ -1272,91 +1559,6 @@ def add_category(category: str, display_name: str | None = None) -> None:
         conn.commit()
         
         
-
-
-def spend_by_category_date_range(start_date: str, end_date: str, limit: int = 5) -> list[tuple]:
-    """Spend totals grouped by category for doc_date within [start_date, end_date].
-    Returns: [(category, sum_total, count), ...] ordered by sum_total desc.
-    """
-    with _connect() as conn:
-        cursor = conn.execute(
-            """
-            SELECT category, COALESCE(SUM(total), 0) AS sum_total, COUNT(*) AS count
-            FROM documents
-            WHERE doc_date BETWEEN ? AND ?
-            GROUP BY category
-            ORDER BY sum_total DESC
-            LIMIT ?
-            """,
-            (start_date, end_date, limit),
-        )
-        return cursor.fetchall()
-
-
-def avg_category_per_week(category: str = "meals", n_weeks: int = 8) -> dict:
-    """Compute average weekly spend for a given category over last n_weeks (by doc_date/created_at)."""
-    category = (category or "meals").lower().strip()
-    with _connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT strftime('%Y-W%W', COALESCE(doc_date, substr(created_at,1,10))) AS wk,
-                   COALESCE(SUM(total),0) AS wk_total
-            FROM documents
-            WHERE LOWER(COALESCE(category,'other')) = ?
-            GROUP BY wk
-            ORDER BY wk DESC
-            LIMIT ?
-            """,
-            (category, n_weeks),
-        ).fetchall()
-    weeks = [r[0] for r in rows]
-    totals = [float(r[1] or 0) for r in rows]
-    avg = (sum(totals) / len(totals)) if totals else 0.0
-    return {"category": category, "weeks": weeks, "weekly_totals": totals, "avg": round(avg, 2)}
-
-
-def set_reimbursable(doc_ids: list[int], reimbursable: int = 1) -> int:
-    """Mark documents as reimbursable (1/0). Returns number of rows updated."""
-    if not doc_ids:
-        return 0
-    reimbursable = 1 if reimbursable else 0
-    with _connect() as conn:
-        qmarks = ",".join(["?"] * len(doc_ids))
-        cur = conn.execute(
-            f"UPDATE documents SET reimbursable = ?, updated_at = datetime('now') WHERE doc_id IN ({qmarks})",
-            (reimbursable, *doc_ids),
-        )
-        conn.commit()
-        return int(cur.rowcount or 0)
-
-
-def get_latest_flagged_doc_id() -> int | None:
-    """Return most recent doc_id that has an audit flag, else None."""
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT doc_id FROM audit_flags ORDER BY datetime(created_at) DESC, flag_id DESC LIMIT 1"
-        ).fetchone()
-    return int(row[0]) if row else None
-
-
-def get_doc_candidates(doc_id: int) -> dict:
-    """Return stored candidate options for a document (vendor/date/total), if present.
-
-    Candidates are stored inside the documents.raw_text column as JSON:
-      {"raw_text": "...", "candidates": {...}, "evidence": {...}}
-    Falls back to empty dict if not available.
-    """
-    doc = get_document_by_id(int(doc_id)) or {}
-    raw = doc.get("raw_text") or ""
-    try:
-        if isinstance(raw, str) and raw.lstrip().startswith("{"):
-            data = json.loads(raw)
-            cands = data.get("candidates") or {}
-            return cands if isinstance(cands, dict) else {}
-    except Exception:
-        pass
-    return {}
-
 def get_edit_history(doc_id: int, limit: int = 50) -> list[dict]:
     """
     Return edit history for a document (most recent first).
