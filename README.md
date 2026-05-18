@@ -2,7 +2,25 @@
 
 **AI-Powered Receipt Intelligence System** — Extract, analyze, and audit receipts with OCR, LLM-powered intent routing, security-hardened agent orchestration, and production-ready Colab deployment.
 
-**Status:** ✅ 100% Complete (May 11, 2026) — 10 implementation phases, 12+ database queries, security guard with injection detection, edit guardrails with high-risk warnings, 4-configuration benchmarking, 23 comprehensive tests, production-ready.
+**Status:** ✅ 100% Complete (May 18, 2026) — 10 implementation phases, 12+ database queries, security guard with injection detection, edit guardrails with high-risk warnings, 4-configuration benchmarking, 23 comprehensive tests, production-ready.
+
+---
+
+## 🚀 Quick Start Navigation
+
+**New to the project?** Start here:
+
+| Goal | Path |
+|------|------|
+| **🎯 Get running in 5 minutes** | [docs/QUICKSTART.md](docs/QUICKSTART.md) |
+| **☁️ Run in Google Colab (free, no install)** | [Colab Setup (2 min)](#quickstart-google-colab--2-minutes) |
+| **📚 Complete setup with all details** | [docs/SETUP.md](docs/SETUP.md) |
+| **⚡ Just run it now** | `python app/main.py` (after setup) |
+| **🧪 Run all tests** | [Testing & Verification](#testing--verification) |
+| **🐛 Troubleshooting** | [docs/SETUP.md#troubleshooting](docs/SETUP.md#troubleshooting) |
+| **📖 Full documentation** | [Documentation Index](../Other/docs/README.md) |
+
+---
 
 ## Key Features
 
@@ -56,30 +74,9 @@ ReceiptIQ/
 
 ## Quickstart (Local - 5 minutes)
 
-Run all commands from the ReceiptIQ project root.
+**For a fast 5-minute setup with copy-paste commands, see [docs/QUICKSTART.md](docs/QUICKSTART.md)**
 
-1. **Create and activate a virtual environment:**
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate
-   ```
-
-2. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. **Initialize the database:**
-   ```bash
-   python scripts/init_db.py
-   ```
-
-4. **Start the application:**
-   ```bash
-   python app/main.py
-   ```
-   
-   Open browser → `http://localhost:7860`
+For detailed setup instructions, see [docs/SETUP.md](docs/SETUP.md)
 
 ---
 
@@ -101,6 +98,14 @@ Run all commands from the ReceiptIQ project root.
 - ✅ Displays results table
 
 **Expected runtime:** 15-25 minutes (first run includes model downloads)
+
+---
+
+## Complete Setup Guide
+
+**For comprehensive setup instructions including system requirements, prerequisites, OS-specific instructions, and step-by-step installation, see [docs/SETUP.md](docs/SETUP.md)**
+
+**For a quick copy-paste setup in 5 minutes, see [docs/QUICKSTART.md](docs/QUICKSTART.md)**
 
 ---
 
@@ -504,6 +509,70 @@ User Input → Security Guard → Intent Router → Tool Executor → Formatter 
 - Privacy: All data stored locally; Mistral inference may expose sensitive data
 
 **See [Limitations & Future Improvements](../Other/docs/limitations_future.md) for roadmap.**
+
+---
+
+## Quick Reference & Support
+
+### 📚 Documentation
+- **[TROUBLESHOOTING.md](../Other/docs/TROUBLESHOOTING.md)** — 30+ setup, runtime, and security issues
+- **[DEPLOYMENT_GUIDE.md](../Other/docs/DEPLOYMENT_GUIDE.md)** — Local, Colab, cloud, and Docker deployment
+- **[API_REFERENCE.md](../Other/docs/API_REFERENCE.md)** — Complete API documentation
+- **[PROJECT_ARCHITECTURE.md](../Other/docs/PROJECT_ARCHITECTURE.md)** — System design and patterns
+- **[BENCHMARK_GUIDE.md](../Other/docs/BENCHMARK_GUIDE.md)** — Testing methodology
+
+### ⚡ Common Commands (Copy-Paste)
+
+**Setup (first time only):**
+```bash
+python3 -m venv .venv
+source .venv/bin/activate  # On Windows: .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python scripts/init_db.py
+```
+
+**Run the application:**
+```bash
+source .venv/bin/activate
+python app/main.py
+# Open: http://localhost:7860
+```
+
+**Run all tests:**
+```bash
+python scripts/run_guardrail_checks.py    # 23 tests total
+python test_security_guard.py             # 6 security tests
+```
+
+**Run benchmarks:**
+```bash
+python scripts/run_benchmark.py           # 4-config performance
+python scripts/eval_sroie_extraction_compare.py --limit 50 --mode both
+```
+
+**Verify installation:**
+```bash
+python scripts/smoke_test.py
+```
+
+### 🎓 For First-Time Users
+1. **Follow [Complete Setup Guide](#complete-setup-guide)** (10 min)
+2. **Run `python app/main.py`** and explore the UI
+3. **Try example queries** from [Example Prompts](#example-prompts)
+4. **Read [TROUBLESHOOTING.md](../Other/docs/TROUBLESHOOTING.md)** if issues arise
+
+### 🏢 For Production Deployment
+1. See [DEPLOYMENT_GUIDE.md](../Other/docs/DEPLOYMENT_GUIDE.md#production-deployment)
+2. Configure environment variables (see [Environment Variables](#environment-variables-optional))
+3. Run security tests: `python test_security_guard.py` (6/6 must pass)
+4. Run guardrails: `python scripts/run_guardrail_checks.py` (23/23 must pass)
+
+### 🤔 Quick Troubleshooting
+- **Setup issue?** → [Troubleshooting Setup Issues](#troubleshooting-setup-issues)
+- **Port in use?** → `python app/main.py --port 7861`
+- **Memory error?** → Close other apps or run on Colab instead
+- **Model too slow?** → Use `phi` instead of `mistral` or try Colab GPU
+- **Tesseract missing?** → `brew install tesseract` (macOS) or `apt-get install tesseract-ocr` (Linux)
 
 ---
 
