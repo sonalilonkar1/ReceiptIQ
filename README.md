@@ -6,22 +6,6 @@
 
 ---
 
-## 🚀 Quick Start Navigation
-
-**New to the project?** Start here:
-
-| Goal | Path |
-|------|------|
-| **🎯 Get running in 5 minutes** | [docs/QUICKSTART.md](docs/QUICKSTART.md) |
-| **☁️ Run in Google Colab (free, no install)** | [Colab Setup (2 min)](#quickstart-google-colab--2-minutes) |
-| **📚 Complete setup with all details** | [docs/SETUP.md](docs/SETUP.md) |
-| **⚡ Just run it now** | `python app/main.py` (after setup) |
-| **🧪 Run all tests** | [Testing & Verification](#testing--verification) |
-| **🐛 Troubleshooting** | [docs/SETUP.md#troubleshooting](docs/SETUP.md#troubleshooting) |
-| **📖 Full documentation** | [Documentation Index](../Other/docs/README.md) |
-
----
-
 ## Key Features
 
 - 🔐 **Security Guard** — Injection attack detection with 40+ patterns (6 attack categories)
@@ -67,39 +51,12 @@ ReceiptIQ/
     injection_tests.json          # 10 security attack test cases
   data/
     cord_100/                     # Receipt dataset
+    sroie_100/                    # SROIE OCR benchmark dataset
+    sample_receipts/              # 📁 You can use receipt images from here to test 
     receipts_db/
       receipts.json
   ../Other/docs/                  # 📖 12+ comprehensive guides
 ```
-
-## Quickstart (Local - 5 minutes)
-
-**For a fast 5-minute setup with copy-paste commands, see [docs/QUICKSTART.md](docs/QUICKSTART.md)**
-
-For detailed setup instructions, see [docs/SETUP.md](docs/SETUP.md)
-
----
-
-## Quickstart (Google Colab - 2 minutes) ⭐
-
-**No setup required! Run in free cloud environment with GPU:**
-
-1. Open [`ReceiptIQ_Colab.ipynb`](./ReceiptIQ_Colab.ipynb) in Google Colab
-2. Run cells sequentially (auto-installs all dependencies)
-3. Access Gradio UI from generated link
-
-**What the notebook does:**
-- ✅ Clones repository
-- ✅ Installs system dependencies (tesseract-ocr, poppler-utils)
-- ✅ Initializes SQLite database
-- ✅ Downloads & processes CORD dataset (100 samples)
-- ✅ Launches Gradio interface
-- ✅ Runs 4 benchmark configurations (5-15 min)
-- ✅ Displays results table
-
-**Expected runtime:** 15-25 minutes (first run includes model downloads)
-
----
 
 ## Complete Setup Guide
 
@@ -153,9 +110,8 @@ Complete incomplete receipts with missing data:
 ### Adding Categories
 Categories are customizable and learned:
 - **Default Categories:** meals, travel, supplies, other
-- **Add Custom Category:** Edit a receipt and set a new category (e.g., "equipment")
-- **Automatic Learning:** When you set vendor + category, system learns the association
-- **Future Auto-Categorization:** New receipts from that vendor get the learned category
+- **Custom Categories:** Edit a receipt and set a new category (e.g., "equipment")
+- **Note:** Category system supports custom values through the UI edit form
 
 ---
 
@@ -201,10 +157,6 @@ Example attack (auto-detected):
 
 ---
 
-## Professor Guardrails Verification
-
-**Comprehensive validation of edit guardrails and data integrity protection.** All 23 tests verify that the system safely handles user edits while protecting data from untrusted modifications.
-
 ### Run All Tests (Recommended)
 ```bash
 python scripts/run_guardrail_checks.py
@@ -224,7 +176,6 @@ Expected output:
     ✓ Integrity checking and status reporting
     ✓ Clean error handling (no stack traces to users)
 
-→ The system is READY FOR PRODUCTION
 ```
 
 ### Individual Test Suites
@@ -442,20 +393,11 @@ python scripts/test_donut_extraction.py path/to/receipt.png --task sroie --verbo
 
 ## Documentation
 
-**For detailed information, see `/Other/docs/`:**
-
+### Quick Reference
 | Document | Purpose |
 |----------|---------|
-| [PROJECT_STATUS.md](../Other/docs/PROJECT_STATUS.md) | 10-phase implementation overview |
-| [IMPLEMENTATION_GUIDE.md](../Other/docs/IMPLEMENTATION_GUIDE.md) | Phase breakdown + security details |
-| [PROJECT_ARCHITECTURE.md](../Other/docs/PROJECT_ARCHITECTURE.md) | System design and patterns |
-| [DEPLOYMENT_GUIDE.md](../Other/docs/DEPLOYMENT_GUIDE.md) | Local, Colab, and production deployment |
-| [API_REFERENCE.md](../Other/docs/API_REFERENCE.md) | Developer API documentation |
-| [BENCHMARK_GUIDE.md](../Other/docs/BENCHMARK_GUIDE.md) | Test methodology and injection attacks |
-| [TROUBLESHOOTING.md](../Other/docs/TROUBLESHOOTING.md) | 30+ troubleshooting scenarios |
-| [Limitations & Future Improvements](../Other/docs/limitations_future.md) | Roadmap and constraints |
-
-**Start here:** [Documentation Index](../Other/docs/README.md)
+| **[QUICKSTART.md](docs/QUICKSTART.md)** | 5-minute setup with copy-paste commands |
+| **[SETUP.md](docs/SETUP.md)** | Detailed installation for all OS, troubleshooting |
 
 ---
 
@@ -482,7 +424,7 @@ User Input → Security Guard → Intent Router → Tool Executor → Formatter 
 - **Database:** SQLite3 with 5 tables
 - **Backend:** Python 3.9+, PyTorch, HuggingFace Transformers
 - **UI:** Gradio web interface
-- **Deployment:** Local, Google Colab, or cloud server
+- **Deployment:** Local
 
 ---
 
@@ -508,20 +450,9 @@ User Input → Security Guard → Intent Router → Tool Executor → Formatter 
 - LLM routing has edge cases for complex multi-part queries
 - Privacy: All data stored locally; Mistral inference may expose sensitive data
 
-**See [Limitations & Future Improvements](../Other/docs/limitations_future.md) for roadmap.**
-
 ---
 
-## Quick Reference & Support
-
-### 📚 Documentation
-- **[TROUBLESHOOTING.md](../Other/docs/TROUBLESHOOTING.md)** — 30+ setup, runtime, and security issues
-- **[DEPLOYMENT_GUIDE.md](../Other/docs/DEPLOYMENT_GUIDE.md)** — Local, Colab, cloud, and Docker deployment
-- **[API_REFERENCE.md](../Other/docs/API_REFERENCE.md)** — Complete API documentation
-- **[PROJECT_ARCHITECTURE.md](../Other/docs/PROJECT_ARCHITECTURE.md)** — System design and patterns
-- **[BENCHMARK_GUIDE.md](../Other/docs/BENCHMARK_GUIDE.md)** — Testing methodology
-
-### ⚡ Common Commands (Copy-Paste)
+### ⚡ Common Commands 
 
 **Setup (first time only):**
 ```bash
@@ -555,36 +486,9 @@ python scripts/eval_sroie_extraction_compare.py --limit 50 --mode both
 python scripts/smoke_test.py
 ```
 
-### 🎓 For First-Time Users
-1. **Follow [Complete Setup Guide](#complete-setup-guide)** (10 min)
-2. **Run `python app/main.py`** and explore the UI
-3. **Try example queries** from [Example Prompts](#example-prompts)
-4. **Read [TROUBLESHOOTING.md](../Other/docs/TROUBLESHOOTING.md)** if issues arise
-
-### 🏢 For Production Deployment
-1. See [DEPLOYMENT_GUIDE.md](../Other/docs/DEPLOYMENT_GUIDE.md#production-deployment)
-2. Configure environment variables (see [Environment Variables](#environment-variables-optional))
-3. Run security tests: `python test_security_guard.py` (6/6 must pass)
-4. Run guardrails: `python scripts/run_guardrail_checks.py` (23/23 must pass)
-
-### 🤔 Quick Troubleshooting
-- **Setup issue?** → [Troubleshooting Setup Issues](#troubleshooting-setup-issues)
-- **Port in use?** → `python app/main.py --port 7861`
-- **Memory error?** → Close other apps or run on Colab instead
-- **Model too slow?** → Use `phi` instead of `mistral` or try Colab GPU
-- **Tesseract missing?** → `brew install tesseract` (macOS) or `apt-get install tesseract-ocr` (Linux)
-
----
-
 ## License
 
 Part of SJSU CMPE-259 NLP Project (May 2026)
 
 ---
 
-## Quick Support
-
-- **Setup issues?** See [TROUBLESHOOTING.md](../Other/docs/TROUBLESHOOTING.md#installation--setup)
-- **Security questions?** See [TROUBLESHOOTING.md - Security & Attack Detection](../Other/docs/TROUBLESHOOTING.md#security--attack-detection-new---may-3)
-- **Performance tuning?** See [DEPLOYMENT_GUIDE.md](../Other/docs/DEPLOYMENT_GUIDE.md#performance-tuning)
-- **API details?** See [API_REFERENCE.md](../Other/docs/API_REFERENCE.md)
